@@ -12,10 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
-ADMIN_ID = [8770379893, 1859432548]
-MAX_THREADS = 30  # Thread 30
+ADMIN_IDS = [8770379893, 1859432548]  # Admin ID ၂ ခု
+MAX_THREADS = 30
 PROGRESS_UPDATE_INTERVAL = 500
-BATCH_SIZE = 10000  # 10k per batch
+BATCH_SIZE = 10000
 # ===================================
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO, datefmt='%H:%M:%S')
@@ -35,6 +35,9 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
 def get_headers(ua, jwt=None):
     headers = {
@@ -112,7 +115,6 @@ def extract_subscription_details(data, plan_type):
     return details
 
 def check_single_account(email, password):
-    """Single account check - with retry logic"""
     if stop_flag:
         return email, password, "STOPPED", "Stopped by user", None
     
@@ -306,7 +308,6 @@ def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, ov
         
         for future in as_completed(futures):
             if stop_flag:
-                # Cancel all pending futures
                 for f in futures:
                     f.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
@@ -345,7 +346,6 @@ def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, ov
                 fail_count += 1
                 logging.info(f"❌ FAIL: {email}")
             
-            # Update progress every 500 combos
             if completed - last_update >= PROGRESS_UPDATE_INTERVAL or completed == batch_total:
                 last_update = completed
                 progress_bar = make_progress_bar(overall_percent)
@@ -393,7 +393,7 @@ def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, ov
     return True
 
 def process_combos(chat_id, combos, message_id):
-    global checking_active, stop_flag, current_batch, total_batches
+    global checking_active, stop_flag
     global super_count, family_count, free_count, fail_count, error_count, error_types
     global all_super_hits, all_family_hits, all_free_accounts
     
@@ -414,7 +414,6 @@ def process_combos(chat_id, combos, message_id):
     total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
     overall_start_time = time.time()
     
-    # Initial message
     progress_text = f"""
 ╔════════════════════════════════════╗
 ║     🦉 DUOLINGO CHECKER            ║
@@ -445,7 +444,6 @@ _Use /stop to cancel_
     except:
         pass
     
-    # Process in batches
     for batch_num in range(1, total_batches + 1):
         if stop_flag:
             bot.send_message(chat_id, "🛑 **Stopped by user.**", parse_mode="Markdown")
@@ -511,7 +509,7 @@ _Use /stop to cancel_
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         bot.reply_to(message, "⛔ Unauthorized user.")
         return
     
@@ -538,30 +536,28 @@ def start_command(message):
 def stop_command(message):
     global stop_flag, checking_active, current_executor, current_futures
     
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         bot.reply_to(message, "⛔ Unauthorized.")
         return
     
     if checking_active:
         stop_flag = True
         
-        # Cancel all running futures immediately
         if current_futures:
             for future in current_futures:
                 future.cancel()
         
-        # Shutdown executor immediately
         if current_executor:
             current_executor.shutdown(wait=False, cancel_futures=True)
         
         bot.reply_to(message, "🛑 **Stopped immediately!**")
-        logging.info("🛑 Stop command received - immediate stop")
+        logging.info(f"🛑 Stop command from {message.from_user.id}")
     else:
         bot.reply_to(message, "ℹ️ No active check.")
 
 @bot.message_handler(func=lambda m: m.text == "📂 Check Duolingo Premium Accounts")
 def ask_file(message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     bot.reply_to(message, "📎 Send your **email:pass** combo file (.txt)", parse_mode="Markdown")
 
@@ -569,7 +565,7 @@ def ask_file(message):
 def handle_file(message):
     global checking_active
     
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         bot.reply_to(message, "⛔ Unauthorized")
         return
     
@@ -603,7 +599,8 @@ def handle_file(message):
 print("🤖 Duolingo Premium Checker Bot is running...")
 print(f"Config: [ DUOLINGO ] BY ThuYa V3")
 print(f"Author: @thuyaaungzaw")
+print(f"Admin IDs: {ADMIN_IDS}")
 print(f"Threads: {MAX_THREADS}")
 print(f"Batch Size: {BATCH_SIZE}")
-print("Features: SUPER PREMIUM | FAMILY PLAN | Created Date | /stop IMMEDIATE")
+print("Features: SUPER PREMIUM | FAMILY PLAN | Created Date | /stop IMMEDIATE | 2 ADMINS")
 bot.infinity_polling()
