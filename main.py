@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
-ADMIN_ID = 8770379893,1859432548
+ADMIN_ID = ( 8770379893 , 1859432548 )
 MAX_THREADS = 30  # Thread 30
 PROGRESS_UPDATE_INTERVAL = 500
 BATCH_SIZE = 10000  # 10k per batch
