@@ -15,7 +15,7 @@ import traceback
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
-ADMIN_IDS = [8770379893]
+ADMIN_IDS = [8770379893, 1859432548]
 MAX_THREADS = 50
 BATCH_SIZE = 10000
 PROGRESS_INTERVAL = 1000
@@ -168,82 +168,125 @@ def parse_billing_from_product(product_id):
         return "📅 Monthly"
     return None
 
-# ========== PAYMENT DETECTION (IMPROVED) ==========
+# ========== PAYMENT DETECTION (IMPROVED v2) ==========
+def _classify_payment_keyword(text):
+    """Match a string against known payment vendor keywords."""
+    if not text:
+        return None
+    t = str(text).lower()
+    # Google Play markers
+    if any(k in t for k in [
+        "google_play", "googleplay", "play_store", "playstore", "play store",
+        "google play", "android_publisher", "purchasetoken", "purchase_token",
+        "androidpublisher", "gpb_", "com.android.vending"
+    ]):
+        return "🟢 Google Play Store"
+    # Apple markers
+    if any(k in t for k in [
+        "app_store", "appstore", "app store", "itunes", "ios_iap",
+        "apple_pay", "apple pay", "apple_iap", "storekit", "originaltransactionid"
+    ]):
+        return "🍎 Apple App Store"
+    # PayPal
+    if "paypal" in t:
+        return "💙 PayPal"
+    # Stripe / Braintree / Web cards
+    if any(k in t for k in ["stripe", "braintree", "adyen", "checkout.com"]):
+        return "💳 Stripe (Web)"
+    # Generic web platform
+    if t in ("web", "website", "duolingo_web"):
+        return "💳 Credit Card (Web)"
+    # Generic platform names
+    if "google" in t or "android" in t:
+        return "🟢 Google Play Store"
+    if "apple" in t or "ios" in t:
+        return "🍎 Apple App Store"
+    return None
+
+
 def detect_payment(data):
-    """Detect payment method from multiple API fields"""
+    """Detect payment method from multiple API fields with deep fallback scan."""
     subscription = data.get("subscription", {}) or {}
     shop_items = data.get("shopItems", []) or []
 
-    # 1. Check subscription.purchasePlatform (most reliable from Android API)
-    platform = subscription.get("purchasePlatform", "").lower()
-    if platform:
-        if "google" in platform or "android" in platform:
-            return "🟢 Google Play"
-        if "apple" in platform or "ios" in platform:
-            return "🍎 Apple"
-        if "web" in platform or "stripe" in platform:
-            return "💳 Credit Card"
+    # --- Priority fields to check in order ---
+    candidates = []
 
-    # 2. Check subscription.paymentProcessor
-    processor = subscription.get("paymentProcessor", "").lower()
-    if processor:
-        if "google" in processor:
-            return "🟢 Google Play"
-        if "apple" in processor:
-            return "🍎 Apple"
-        if "paypal" in processor:
-            return "💙 PayPal"
-        if "stripe" in processor or "braintree" in processor:
-            return "💳 Credit Card"
+    # 1. subscription.purchasePlatform / paymentProcessor / vendorType
+    for k in ("purchasePlatform", "paymentProcessor", "vendor", "vendorType",
+              "platform", "store", "source", "billingPlatform"):
+        v = subscription.get(k)
+        if v:
+            candidates.append(v)
 
-    # 3. Check billingInfo inside subscription
+    # 2. subscription.billingInfo.*
     billing_info = subscription.get("billingInfo", {}) or {}
-    bp = billing_info.get("paymentProcessor", "").lower()
-    if bp:
-        if "google" in bp:
-            return "🟢 Google Play"
-        if "apple" in bp:
-            return "🍎 Apple"
-        if "stripe" in bp or "braintree" in bp:
-            return "💳 Credit Card"
+    for k in ("paymentProcessor", "vendor", "platform", "store", "source"):
+        v = billing_info.get(k)
+        if v:
+            candidates.append(v)
 
-    # 4. Check shopItems for subscription info
+    # 3. shopItems[].subscriptionInfo.*
     for item in shop_items:
-        sub_info = item.get("subscriptionInfo", {}) or {}
-        sp = sub_info.get("purchasePlatform", "").lower()
-        if sp:
-            if "google" in sp or "android" in sp:
-                return "🟢 Google Play"
-            if "apple" in sp or "ios" in sp:
-                return "🍎 Apple"
-            if "web" in sp:
-                return "💳 Credit Card"
-
-        # Check receipt
-        receipt = sub_info.get("receipt", {})
+        si = item.get("subscriptionInfo", {}) or {}
+        for k in ("purchasePlatform", "vendor", "platform", "store", "source", "paymentProcessor"):
+            v = si.get(k)
+            if v:
+                candidates.append(v)
+        # Receipts often contain purchaseToken (Google) or originalTransactionId (Apple)
+        receipt = si.get("receipt")
         if receipt:
-            rs = json.dumps(receipt).lower() if isinstance(receipt, dict) else str(receipt).lower()
-            if "google" in rs or "purchasetoken" in rs:
-                return "🟢 Google Play"
-            if "apple" in rs or "itunes" in rs:
-                return "🍎 Apple"
+            candidates.append(json.dumps(receipt) if isinstance(receipt, dict) else str(receipt))
 
-    # 5. Check product ID patterns
-    product_id = subscription.get("productId", "")
+    # 4. Try to classify any of the prioritized candidates
+    for c in candidates:
+        result = _classify_payment_keyword(c)
+        if result:
+            return result
+
+    # 5. Product ID patterns
+    product_ids = []
+    if subscription.get("productId"):
+        product_ids.append(subscription["productId"])
     for item in shop_items:
         si = item.get("subscriptionInfo", {}) or {}
         if si.get("productId"):
-            product_id = si.get("productId", "")
-    if product_id:
-        pl = product_id.lower()
-        if "google" in pl or "android" in pl:
-            return "🟢 Google Play"
-        if "apple" in pl or "ios" in pl:
-            return "🍎 Apple"
+            product_ids.append(si["productId"])
+    for pid in product_ids:
+        pl = str(pid).lower()
+        # Android product IDs typically use reverse-DNS style: com.duolingo.xxx
+        if pl.startswith("com.duolingo") or "android" in pl or "google" in pl or "_gp_" in pl or ".gp." in pl:
+            return "🟢 Google Play Store"
+        if "ios" in pl or "apple" in pl or "_ios_" in pl:
+            return "🍎 Apple App Store"
+        if "web" in pl or "stripe" in pl:
+            return "💳 Stripe (Web)"
 
-    # 6. Fallback: if premium but unknown method
+    # 6. Deep scan: search the entire payload as JSON for vendor markers
+    try:
+        full_dump = json.dumps(data).lower()
+        # Check most specific markers first
+        if "purchasetoken" in full_dump or "googleplay" in full_dump or "google_play" in full_dump or "androidpublisher" in full_dump:
+            return "🟢 Google Play Store"
+        if "originaltransactionid" in full_dump or "app_store" in full_dump or "itunes" in full_dump or "storekit" in full_dump:
+            return "🍎 Apple App Store"
+        if "paypal" in full_dump:
+            return "💙 PayPal"
+        if "stripe" in full_dump or "braintree" in full_dump:
+            return "💳 Stripe (Web)"
+    except Exception:
+        pass
+
+    # 7. Heuristic: if user has linked Google account and is premium → likely Google Play
     if data.get("hasPlus") or data.get("has_item_premium_subscription"):
-        return "💎 Unknown"
+        if data.get("hasGoogleId"):
+            return "🟢 Google Play Store (likely)"
+        if data.get("hasAppleId") or any(
+            (a.get("provider", "").lower() == "apple")
+            for a in (data.get("linkedAccounts", []) or [])
+        ):
+            return "🍎 Apple App Store (likely)"
+        return "💎 Premium (source unknown)"
 
     return "❓ N/A"
 
