@@ -15,7 +15,7 @@ import traceback
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "8689449943:AAHFZdaE4L0TkH6S9BAAtmdWbwoTJYyzcJQ"
-ADMIN_IDS = [8770379893, 1859432548]
+ADMIN_IDS = [8770379893]
 MAX_THREADS = 50
 BATCH_SIZE = 10000
 PROGRESS_INTERVAL = 1000
@@ -1133,10 +1133,6 @@ def run_bot():
         try:
             try:
                 bot.remove_webhook()
-            except Exception:
-                pass
-            try:
-                bot.stop_polling()
             except Exception:
                 pass
             time.sleep(1)
