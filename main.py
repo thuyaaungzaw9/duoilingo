@@ -643,7 +643,7 @@ def send_stats(chat_id):
 # ========== CALLBACK HANDLER ==========
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    global MAX_THREADS, checking_active, stop_flag, current_executor, current_futures
+    global MAX_THREADS, MAX_RETRIES, checking_active, stop_flag, current_executor, current_futures
     global super_count, family_count, free_count, fail_count
     global all_super_hits, all_family_hits
 
@@ -722,7 +722,6 @@ def callback_handler(call):
             send_main_menu(call.message.chat.id)
 
         elif call.data.startswith("set_retry_"):
-            global MAX_RETRIES
             MAX_RETRIES = int(call.data.split("_")[2])
             bot.answer_callback_query(call.id, f"✅ Retries → {MAX_RETRIES}x")
             send_main_menu(call.message.chat.id)
