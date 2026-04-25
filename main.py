@@ -113,6 +113,66 @@ def is_authorized(user_id):
 # pending admin actions (chat_id -> action_name)
 pending_admin_action = {}
 
+# ========== PROXY MANAGEMENT ==========
+PROXY_FILE = "proxies.json"
+proxy_list = []        # list of dicts: {"proxy": "host:port:user:pass", "type": "HTTP"}
+active_proxy_type = "HTTP"  # default proxy type for new additions
+proxy_lock = threading.Lock()
+pending_proxy_action = {}  # chat_id -> action type
+
+PROXY_TYPES = ["HTTP", "HTTPS", "SOCKS4", "SOCKS5"]
+
+def load_proxies():
+    global proxy_list
+    try:
+        if os.path.exists(PROXY_FILE):
+            with open(PROXY_FILE, "r") as f:
+                proxy_list = json.load(f)
+    except Exception:
+        proxy_list = []
+
+def save_proxies():
+    try:
+        with open(PROXY_FILE, "w") as f:
+            json.dump(proxy_list, f, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to save proxies: {e}")
+
+def get_proxy_url(proxy_entry):
+    """Convert proxy entry to requests-compatible proxy URL."""
+    ptype = proxy_entry.get("type", "HTTP").upper()
+    raw = proxy_entry.get("proxy", "")
+    parts = raw.split(":")
+    if len(parts) == 4:
+        host, port, user, passwd = parts
+        if ptype in ("SOCKS4", "SOCKS5"):
+            scheme = "socks4" if ptype == "SOCKS4" else "socks5"
+            return f"{scheme}://{user}:{passwd}@{host}:{port}"
+        else:
+            scheme = "https" if ptype == "HTTPS" else "http"
+            return f"{scheme}://{user}:{passwd}@{host}:{port}"
+    elif len(parts) == 2:
+        host, port = parts
+        if ptype in ("SOCKS4", "SOCKS5"):
+            scheme = "socks4" if ptype == "SOCKS4" else "socks5"
+            return f"{scheme}://{host}:{port}"
+        else:
+            scheme = "https" if ptype == "HTTPS" else "http"
+            return f"{scheme}://{host}:{port}"
+    return None
+
+def get_random_proxy():
+    """Get a random proxy from the list."""
+    import random
+    with proxy_lock:
+        if not proxy_list:
+            return None
+        entry = random.choice(proxy_list)
+        return get_proxy_url(entry), entry.get("type", "HTTP")
+    return None
+
+
+
 def create_session():
     session = requests.Session()
     retry_strategy = Retry(
@@ -124,6 +184,15 @@ def create_session():
     adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    # Apply random proxy if available
+    proxy_info = get_random_proxy()
+    if proxy_info:
+        proxy_url, ptype = proxy_info
+        if ptype in ("SOCKS4", "SOCKS5"):
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+        else:
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+        logging.debug(f"Using proxy: {ptype}")
     return session
 
 def get_headers(ua, jwt=None):
@@ -738,6 +807,96 @@ def send_stats(chat_id):
     markup.add(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
     bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
 
+
+# ========== PROXY MENU ==========
+def send_proxy_menu(chat_id):
+    with proxy_lock:
+        total = len(proxy_list)
+        types_count = {}
+        for p in proxy_list:
+            t = p.get("type", "HTTP")
+            types_count[t] = types_count.get(t, 0) + 1
+    
+    type_info = " ∙ ".join(f"{t}:{c}" for t, c in types_count.items()) if types_count else "None"
+    
+    msg = f"""{'━' * 32}
+🌐 𝗣𝗥𝗢𝗫𝗬  𝗠𝗔𝗡𝗔𝗚𝗘𝗥
+{'━' * 32}
+📊 Total Proxies: *{total}*
+📋 Types: {type_info}
+
+Manage your proxy list below."""
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        InlineKeyboardButton("➕ ADD", callback_data="proxy_add"),
+        InlineKeyboardButton("➖ REMOVE", callback_data="proxy_remove")
+    )
+    markup.row(
+        InlineKeyboardButton("📋 LIST", callback_data="proxy_list"),
+        InlineKeyboardButton("🗑️ CLEAR ALL", callback_data="proxy_clear")
+    )
+    markup.row(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
+    bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
+
+def send_proxy_type_selector(chat_id):
+    """Show proxy type selection before adding."""
+    msg = f"""🌐 *Select Proxy Type*
+
+Choose the type for your proxy:"""
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        InlineKeyboardButton("🔵 HTTP", callback_data="proxy_type_HTTP"),
+        InlineKeyboardButton("🟢 HTTPS", callback_data="proxy_type_HTTPS")
+    )
+    markup.row(
+        InlineKeyboardButton("🟠 SOCKS4", callback_data="proxy_type_SOCKS4"),
+        InlineKeyboardButton("🔴 SOCKS5", callback_data="proxy_type_SOCKS5")
+    )
+    markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
+    bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
+
+def send_proxy_list(chat_id, page=0):
+    with proxy_lock:
+        total = len(proxy_list)
+    if total == 0:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
+        bot.send_message(chat_id, "📭 No proxies added yet.", reply_markup=markup)
+        return
+    
+    per_page = 10
+    total_pages = (total + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = min(start + per_page, total)
+    
+    text = f"🌐 *PROXIES* ({page+1}/{total_pages})\n\n"
+    with proxy_lock:
+        for i, p in enumerate(proxy_list[start:end], start=start+1):
+            ptype = p.get("type", "HTTP")
+            raw = p.get("proxy", "?")
+            # Mask credentials
+            parts = raw.split(":")
+            if len(parts) >= 2:
+                display = f"{parts[0]}:{parts[1]}"
+            else:
+                display = raw[:20]
+            icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(ptype, "⚪")
+            text += f"{icon} `[{i}]` {ptype} ∙ `{display}`\n"
+    
+    markup = InlineKeyboardMarkup(row_width=3)
+    btns = []
+    if page > 0:
+        btns.append(InlineKeyboardButton("◀️", callback_data=f"proxy_pg_{page-1}"))
+    btns.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        btns.append(InlineKeyboardButton("▶️", callback_data=f"proxy_pg_{page+1}"))
+    if btns:
+        markup.row(*btns)
+    markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
+    bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
+
 # ========== CALLBACK HANDLER ==========
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
@@ -765,15 +924,18 @@ def callback_handler(call):
 
         elif call.data == "tools":
             bot.answer_callback_query(call.id)
+            with proxy_lock:
+                proxy_count = len(proxy_list)
             markup = InlineKeyboardMarkup(row_width=2)
             markup.add(
                 InlineKeyboardButton("🧵 THREADS", callback_data="thread_settings"),
                 InlineKeyboardButton("🔄 RETRIES", callback_data="retry_settings")
             )
+            markup.row(InlineKeyboardButton(f"🌐 PROXIES ({proxy_count})", callback_data="proxy_menu"))
             markup.row(InlineKeyboardButton("🗑️ CLEAR ALL", callback_data="clear_hits"))
             markup.add(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
             bot.send_message(call.message.chat.id,
-                f"⚙️ 🧵{MAX_THREADS} ∙ 🔄{MAX_RETRIES}x ∙ ⏱{REQUEST_TIMEOUT}s",
+                f"⚙️ 🧵{MAX_THREADS} ∙ 🔄{MAX_RETRIES}x ∙ ⏱{REQUEST_TIMEOUT}s ∙ 🌐{proxy_count} proxies",
                 parse_mode='Markdown', reply_markup=markup)
 
         elif call.data == "thread_settings":
@@ -857,6 +1019,88 @@ def callback_handler(call):
         elif call.data.startswith("hits_page_"):
             page = int(call.data.split("_")[2])
             send_hits_list(call.message.chat.id, page)
+
+
+        # ========== PROXY CALLBACKS ==========
+        elif call.data == "proxy_menu":
+            bot.answer_callback_query(call.id)
+            send_proxy_menu(call.message.chat.id)
+
+        elif call.data == "proxy_add":
+            bot.answer_callback_query(call.id)
+            send_proxy_type_selector(call.message.chat.id)
+
+        elif call.data.startswith("proxy_type_"):
+            bot.answer_callback_query(call.id)
+            selected_type = call.data.replace("proxy_type_", "")
+            if selected_type in PROXY_TYPES:
+                pending_proxy_action[call.from_user.id] = {"action": "add", "type": selected_type}
+                icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(selected_type, "⚪")
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton("❌ Cancel", callback_data="proxy_cancel"))
+                bot.send_message(call.message.chat.id,
+                    f"{icon} *Add {selected_type} Proxy*\n\n"
+                    f"Send proxy in format:\n"
+                    f"`host:port:username:password`\n\n"
+                    f"Example:\n`proxy.geonode.io:11000:user:pass`\n\n"
+                    f"💡 You can also send multiple proxies (one per line).",
+                    parse_mode='Markdown', reply_markup=markup)
+
+        elif call.data == "proxy_remove":
+            bot.answer_callback_query(call.id)
+            with proxy_lock:
+                if not proxy_list:
+                    bot.send_message(call.message.chat.id, "📭 No proxies to remove.")
+                    send_proxy_menu(call.message.chat.id)
+                    return
+                markup = InlineKeyboardMarkup(row_width=1)
+                for i, p in enumerate(proxy_list[:20]):
+                    ptype = p.get("type", "HTTP")
+                    raw = p.get("proxy", "?")
+                    parts = raw.split(":")
+                    display = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else raw[:20]
+                    icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(ptype, "⚪")
+                    markup.add(InlineKeyboardButton(f"❌ {icon} {ptype} {display}", callback_data=f"proxy_del_{i}"))
+                markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
+            bot.send_message(call.message.chat.id,
+                "➖ *Remove Proxy*\nTap to remove:",
+                parse_mode='Markdown', reply_markup=markup)
+
+        elif call.data.startswith("proxy_del_"):
+            try:
+                idx = int(call.data.replace("proxy_del_", ""))
+                with proxy_lock:
+                    if 0 <= idx < len(proxy_list):
+                        removed = proxy_list.pop(idx)
+                        save_proxies()
+                        bot.answer_callback_query(call.id, f"✅ Removed proxy #{idx+1}")
+                    else:
+                        bot.answer_callback_query(call.id, "❌ Invalid index")
+            except Exception:
+                bot.answer_callback_query(call.id, "⚠️ Error")
+            send_proxy_menu(call.message.chat.id)
+
+        elif call.data == "proxy_list":
+            bot.answer_callback_query(call.id)
+            send_proxy_list(call.message.chat.id, 0)
+
+        elif call.data.startswith("proxy_pg_"):
+            bot.answer_callback_query(call.id)
+            page = int(call.data.replace("proxy_pg_", ""))
+            send_proxy_list(call.message.chat.id, page)
+
+        elif call.data == "proxy_clear":
+            bot.answer_callback_query(call.id)
+            with proxy_lock:
+                proxy_list.clear()
+                save_proxies()
+            bot.send_message(call.message.chat.id, "✅ All proxies cleared!")
+            send_proxy_menu(call.message.chat.id)
+
+        elif call.data == "proxy_cancel":
+            bot.answer_callback_query(call.id, "Cancelled")
+            pending_proxy_action.pop(call.from_user.id, None)
+            send_proxy_menu(call.message.chat.id)
 
         # ========== ADMIN PANEL ==========
         elif call.data == "admin_panel":
@@ -1209,9 +1453,49 @@ def admin_text_input(message):
             bot.reply_to(message, "❌ Invalid ID. Must be numeric.")
         send_admin_panel(message.chat.id)
 
+
+# Capture text replies for proxy "add" flow
+@bot.message_handler(func=lambda m: m.from_user.id in pending_proxy_action,
+                     content_types=['text'])
+def proxy_text_input(message):
+    info = pending_proxy_action.pop(message.from_user.id, None)
+    if not info or info.get("action") != "add":
+        return
+    
+    ptype = info.get("type", "HTTP")
+    text = message.text.strip()
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    
+    added = 0
+    errors = 0
+    for line in lines:
+        parts = line.split(":")
+        if len(parts) >= 2:
+            with proxy_lock:
+                proxy_list.append({"proxy": line, "type": ptype})
+            added += 1
+        else:
+            errors += 1
+    
+    if added > 0:
+        with proxy_lock:
+            save_proxies()
+        icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(ptype, "⚪")
+        msg = f"{icon} ✅ Added *{added}* {ptype} proxy(s)"
+        if errors > 0:
+            msg += f"\n⚠️ {errors} invalid line(s) skipped"
+        with proxy_lock:
+            msg += f"\n📊 Total proxies: *{len(proxy_list)}*"
+        bot.reply_to(message, msg, parse_mode='Markdown')
+    else:
+        bot.reply_to(message, "❌ Invalid format. Use `host:port:user:pass`", parse_mode='Markdown')
+    
+    send_proxy_menu(message.chat.id)
+
 # ========== BOT START ==========
 def run_bot():
     load_users()
+    load_proxies()
     # Ensure no other polling instance / webhook is active (fixes 409 Conflict)
     while True:
         try:
@@ -1225,6 +1509,7 @@ def run_bot():
             print("🦉 DUOLINGO CHECKER V8 (Multi-User)")
             print(f"👑 Admins: {ADMIN_IDS}")
             print(f"👥 Authorized users: {len(allowed_users)}")
+            print(f"🌐 Proxies loaded: {len(proxy_list)}")
             print(f"🧵 {MAX_THREADS} threads ∙ 🔄 {MAX_RETRIES}x ∙ ⏱ {REQUEST_TIMEOUT}s")
             print(f"🔀 Concurrent users supported: 10 (threaded polling)")
             print("═" * 40)
