@@ -849,7 +849,7 @@ def send_stats(chat_id):
 
 
 # ========== PROXY MENU ==========
-def send_proxy_menu(chat_id):
+def send_proxy_menu(chat_id, message_id=None):
     with proxy_lock:
         total = len(proxy_list)
         types_count = {}
@@ -878,9 +878,15 @@ Manage your proxy list below."""
     )
     markup.row(InlineKeyboardButton("🧪 TEST LIVE", callback_data="proxy_test"))
     markup.row(InlineKeyboardButton("🏠 MENU", callback_data="main_menu"))
+    if message_id:
+        try:
+            bot.edit_message_text(msg, chat_id, message_id, parse_mode='Markdown', reply_markup=markup)
+            return
+        except Exception:
+            pass
     bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
 
-def send_proxy_type_selector(chat_id):
+def send_proxy_type_selector(chat_id, message_id=None):
     """Show proxy type selection before adding."""
     msg = f"""🌐 *Select Proxy Type*
 
@@ -895,14 +901,26 @@ Choose the type for your proxy:"""
         InlineKeyboardButton("🔴 SOCKS5", callback_data="proxy_type_SOCKS5")
     )
     markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
+    if message_id:
+        try:
+            bot.edit_message_text(msg, chat_id, message_id, parse_mode='Markdown', reply_markup=markup)
+            return
+        except Exception:
+            pass
     bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=markup)
 
-def send_proxy_list(chat_id, page=0):
+def send_proxy_list(chat_id, page=0, message_id=None):
     with proxy_lock:
         total = len(proxy_list)
     if total == 0:
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
+        if message_id:
+            try:
+                bot.edit_message_text("📭 No proxies added yet.", chat_id, message_id, reply_markup=markup)
+                return
+            except Exception:
+                pass
         bot.send_message(chat_id, "📭 No proxies added yet.", reply_markup=markup)
         return
     
@@ -917,7 +935,6 @@ def send_proxy_list(chat_id, page=0):
         for i, p in enumerate(proxy_list[start:end], start=start+1):
             ptype = p.get("type", "HTTP")
             raw = p.get("proxy", "?")
-            # Mask credentials
             parts = raw.split(":")
             if len(parts) >= 2:
                 display = f"{parts[0]}:{parts[1]}"
@@ -936,6 +953,12 @@ def send_proxy_list(chat_id, page=0):
     if btns:
         markup.row(*btns)
     markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, parse_mode='Markdown', reply_markup=markup)
+            return
+        except Exception:
+            pass
     bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
 
 # ========== CALLBACK HANDLER ==========
@@ -1065,11 +1088,11 @@ def callback_handler(call):
         # ========== PROXY CALLBACKS ==========
         elif call.data == "proxy_menu":
             bot.answer_callback_query(call.id)
-            send_proxy_menu(call.message.chat.id)
+            send_proxy_menu(call.message.chat.id, call.message.message_id)
 
         elif call.data == "proxy_add":
             bot.answer_callback_query(call.id)
-            send_proxy_type_selector(call.message.chat.id)
+            send_proxy_type_selector(call.message.chat.id, call.message.message_id)
 
         elif call.data.startswith("proxy_type_"):
             bot.answer_callback_query(call.id)
@@ -1079,20 +1102,24 @@ def callback_handler(call):
                 icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(selected_type, "⚪")
                 markup = InlineKeyboardMarkup()
                 markup.row(InlineKeyboardButton("❌ Cancel", callback_data="proxy_cancel"))
-                bot.send_message(call.message.chat.id,
+                txt = (
                     f"{icon} *Add {selected_type} Proxy*\n\n"
                     f"Send proxy in format:\n"
                     f"`host:port:username:password`\n\n"
                     f"Example:\n`proxy.geonode.io:11000:user:pass`\n\n"
-                    f"💡 You can also send multiple proxies (one per line).",
-                    parse_mode='Markdown', reply_markup=markup)
+                    f"💡 You can also send multiple proxies (one per line)."
+                )
+                try:
+                    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
+                                          parse_mode='Markdown', reply_markup=markup)
+                except Exception:
+                    bot.send_message(call.message.chat.id, txt, parse_mode='Markdown', reply_markup=markup)
 
         elif call.data == "proxy_remove":
             bot.answer_callback_query(call.id)
             with proxy_lock:
                 if not proxy_list:
-                    bot.send_message(call.message.chat.id, "📭 No proxies to remove.")
-                    send_proxy_menu(call.message.chat.id)
+                    send_proxy_menu(call.message.chat.id, call.message.message_id)
                     return
                 markup = InlineKeyboardMarkup(row_width=1)
                 for i, p in enumerate(proxy_list[:20]):
@@ -1103,9 +1130,13 @@ def callback_handler(call):
                     icon = {"HTTP": "🔵", "HTTPS": "🟢", "SOCKS4": "🟠", "SOCKS5": "🔴"}.get(ptype, "⚪")
                     markup.add(InlineKeyboardButton(f"❌ {icon} {ptype} {display}", callback_data=f"proxy_del_{i}"))
                 markup.row(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
-            bot.send_message(call.message.chat.id,
-                "➖ *Remove Proxy*\nTap to remove:",
-                parse_mode='Markdown', reply_markup=markup)
+            try:
+                bot.edit_message_text("➖ *Remove Proxy*\nTap to remove:",
+                                      call.message.chat.id, call.message.message_id,
+                                      parse_mode='Markdown', reply_markup=markup)
+            except Exception:
+                bot.send_message(call.message.chat.id, "➖ *Remove Proxy*\nTap to remove:",
+                                 parse_mode='Markdown', reply_markup=markup)
 
         elif call.data.startswith("proxy_del_"):
             try:
@@ -1119,45 +1150,46 @@ def callback_handler(call):
                         bot.answer_callback_query(call.id, "❌ Invalid index")
             except Exception:
                 bot.answer_callback_query(call.id, "⚠️ Error")
-            send_proxy_menu(call.message.chat.id)
+            send_proxy_menu(call.message.chat.id, call.message.message_id)
 
         elif call.data == "proxy_list":
             bot.answer_callback_query(call.id)
-            send_proxy_list(call.message.chat.id, 0)
+            send_proxy_list(call.message.chat.id, 0, call.message.message_id)
 
         elif call.data.startswith("proxy_pg_"):
             bot.answer_callback_query(call.id)
             page = int(call.data.replace("proxy_pg_", ""))
-            send_proxy_list(call.message.chat.id, page)
+            send_proxy_list(call.message.chat.id, page, call.message.message_id)
 
         elif call.data == "proxy_clear":
-            bot.answer_callback_query(call.id)
+            bot.answer_callback_query(call.id, "✅ All proxies cleared!")
             with proxy_lock:
                 proxy_list.clear()
                 save_proxies()
-            bot.send_message(call.message.chat.id, "✅ All proxies cleared!")
-            send_proxy_menu(call.message.chat.id)
+            send_proxy_menu(call.message.chat.id, call.message.message_id)
 
         elif call.data == "proxy_cancel":
             bot.answer_callback_query(call.id, "Cancelled")
             pending_proxy_action.pop(call.from_user.id, None)
-            send_proxy_menu(call.message.chat.id)
+            send_proxy_menu(call.message.chat.id, call.message.message_id)
 
         elif call.data == "proxy_test":
             bot.answer_callback_query(call.id, "🧪 Testing…")
             with proxy_lock:
                 snap = list(proxy_list)
             if not snap:
-                bot.send_message(call.message.chat.id, "📭 No proxies to test.")
-                send_proxy_menu(call.message.chat.id)
+                send_proxy_menu(call.message.chat.id, call.message.message_id)
                 return
 
             chat_id = call.message.chat.id
-            status_msg = bot.send_message(
-                chat_id,
-                f"🧪 *Testing {len(snap)} proxy(s)…*\n_Hitting api.ipify.org via each proxy_",
-                parse_mode='Markdown'
-            )
+            msg_id = call.message.message_id
+            try:
+                bot.edit_message_text(
+                    f"🧪 *Testing {len(snap)} proxy(s)…*\n_Hitting api.ipify.org via each proxy_",
+                    chat_id, msg_id, parse_mode='Markdown'
+                )
+            except Exception:
+                pass
 
             def _run_test():
                 results = [None] * len(snap)
@@ -1189,15 +1221,19 @@ def callback_handler(call):
                         lines.append(f"{head}\n   ✅ LIVE · IP `{r['ip']}` · {r['latency']}ms")
                     else:
                         lines.append(f"{head}\n   ❌ DEAD · {r['error']} · {r['latency']}ms")
+                lines.append("")
+                lines.append("Tap below to go back.")
+
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("⬅️ BACK", callback_data="proxy_menu"))
 
                 txt = "\n".join(lines)
                 if len(txt) > 3900:
                     txt = txt[:3900] + "\n…(truncated)"
                 try:
-                    bot.edit_message_text(txt, chat_id, status_msg.message_id, parse_mode='Markdown')
+                    bot.edit_message_text(txt, chat_id, msg_id, parse_mode='Markdown', reply_markup=markup)
                 except Exception:
-                    bot.send_message(chat_id, txt, parse_mode='Markdown')
-                send_proxy_menu(chat_id)
+                    bot.send_message(chat_id, txt, parse_mode='Markdown', reply_markup=markup)
 
             threading.Thread(target=_run_test, daemon=True).start()
 
