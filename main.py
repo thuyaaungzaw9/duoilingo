@@ -1002,16 +1002,21 @@ def callback_handler(call):
                 f"⚙️ 🧵{MAX_THREADS} ∙ 🔄{MAX_RETRIES}x ∙ ⏱{REQUEST_TIMEOUT}s ∙ 🌐{proxy_count} proxies",
                 parse_mode='Markdown', reply_markup=markup)
 
-        elif call.data == "thread_settings":
-            bot.answer_callback_query(call.id)
-            markup = InlineKeyboardMarkup(row_width=4)
-            markup.row(
-                InlineKeyboardButton("10", callback_data="set_threads_10"),
-                InlineKeyboardButton("20", callback_data="set_threads_20"),
-                InlineKeyboardButton("30", callback_data="set_threads_30"),
-                InlineKeyboardButton("50", callback_data="set_threads_50")
-            )
-            markup.add(InlineKeyboardButton("⬅️", callback_data="tools"))
+         elif call.data == "thread_settings":
+             bot.answer_callback_query(call.id)
+             markup = InlineKeyboardMarkup(row_width=4)
+             markup.row(
+                 InlineKeyboardButton("10", callback_data="set_threads_10"),
+                 InlineKeyboardButton("20", callback_data="set_threads_20"),
+                 InlineKeyboardButton("30", callback_data="set_threads_30"),
+                 InlineKeyboardButton("50", callback_data="set_threads_50")
+             )
+             markup.row(
+                 InlineKeyboardButton("70", callback_data="set_threads_70"),
+                 InlineKeyboardButton("80", callback_data="set_threads_80"),
+                 InlineKeyboardButton("100", callback_data="set_threads_100")
+             )
+             markup.add(InlineKeyboardButton("⬅️", callback_data="tools"))
             bot.send_message(call.message.chat.id, f"🧵 Current: `{MAX_THREADS}`", parse_mode='Markdown', reply_markup=markup)
 
         elif call.data == "retry_settings":
@@ -1065,20 +1070,21 @@ def callback_handler(call):
 
         elif call.data == "copy_all_hits":
             bot.answer_callback_query(call.id)
-            txt = f"🦉 HITS {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'═'*30}\n\n"
-            for e, p, r in all_super_hits:
-                txt += r + "\n\n"
-            for e, p, r in all_family_hits:
-                txt += r + "\n\n"
-            if txt.strip():
-                if len(txt) > 4000:
-                    parts = [txt[i:i+4000] for i in range(0, len(txt), 4000)]
-                    for i, part in enumerate(parts):
-                        bot.send_message(call.message.chat.id, f"📋 Part {i+1}/{len(parts)}:\n```\n{part}```", parse_mode='Markdown')
-                else:
-                    bot.send_message(call.message.chat.id, f"📋\n```\n{txt}```", parse_mode='Markdown')
-            else:
+            with hits_lock:
+                has_hits = len(all_super_hits) + len(all_family_hits) > 0
+            if not has_hits:
                 bot.send_message(call.message.chat.id, "📭 No hits.")
+            else:
+                import io
+                txt = f"HITS {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*30}\n\n"
+                with hits_lock:
+                    for e, p, r in all_super_hits:
+                        txt += f"{e}:{p}\n"
+                    for e, p, r in all_family_hits:
+                        txt += f"{e}:{p}\n"
+                file_obj = io.BytesIO(txt.encode('utf-8'))
+                file_obj.name = f"hits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                bot.send_document(call.message.chat.id, file_obj, caption=f"📋 Total Hits: {len(all_super_hits) + len(all_family_hits)}")
 
         elif call.data.startswith("hits_page_"):
             page = int(call.data.split("_")[2])
