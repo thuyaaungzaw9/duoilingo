@@ -1078,13 +1078,18 @@ def callback_handler(call):
                 import io
                 txt = f"HITS {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*30}\n\n"
                 with hits_lock:
-                    for e, p, r in all_super_hits:
-                        txt += f"{e}:{p}\n"
-                    for e, p, r in all_family_hits:
-                        txt += f"{e}:{p}\n"
+                    if all_super_hits:
+                        txt += f"===== SUPER HITS ({len(all_super_hits)}) =====\n\n"
+                        for e, p, r in all_super_hits:
+                            txt += f"{e}:{p}\n{r}\n{'-'*30}\n"
+                    if all_family_hits:
+                        txt += f"\n===== FAMILY HITS ({len(all_family_hits)}) =====\n\n"
+                        for e, p, r in all_family_hits:
+                            txt += f"{e}:{p}\n{r}\n{'-'*30}\n"
+                    total = len(all_super_hits) + len(all_family_hits)
                 file_obj = io.BytesIO(txt.encode('utf-8'))
                 file_obj.name = f"hits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                bot.send_document(call.message.chat.id, file_obj, caption=f"📋 Total Hits: {len(all_super_hits) + len(all_family_hits)}")
+                bot.send_document(call.message.chat.id, file_obj, caption=f"📋 Total Hits: {total}")
 
         elif call.data.startswith("hits_page_"):
             page = int(call.data.split("_")[2])
