@@ -1002,21 +1002,21 @@ def callback_handler(call):
                 f"⚙️ 🧵{MAX_THREADS} ∙ 🔄{MAX_RETRIES}x ∙ ⏱{REQUEST_TIMEOUT}s ∙ 🌐{proxy_count} proxies",
                 parse_mode='Markdown', reply_markup=markup)
 
-         elif call.data == "thread_settings":
-             bot.answer_callback_query(call.id)
-             markup = InlineKeyboardMarkup(row_width=4)
-             markup.row(
-                 InlineKeyboardButton("10", callback_data="set_threads_10"),
-                 InlineKeyboardButton("20", callback_data="set_threads_20"),
-                 InlineKeyboardButton("30", callback_data="set_threads_30"),
-                 InlineKeyboardButton("50", callback_data="set_threads_50")
-             )
-             markup.row(
-                 InlineKeyboardButton("70", callback_data="set_threads_70"),
-                 InlineKeyboardButton("80", callback_data="set_threads_80"),
-                 InlineKeyboardButton("100", callback_data="set_threads_100")
-             )
-             markup.add(InlineKeyboardButton("⬅️", callback_data="tools"))
+        elif call.data == "thread_settings":
+            bot.answer_callback_query(call.id)
+            markup = InlineKeyboardMarkup(row_width=4)
+            markup.row(
+                InlineKeyboardButton("10", callback_data="set_threads_10"),
+                InlineKeyboardButton("20", callback_data="set_threads_20"),
+                InlineKeyboardButton("30", callback_data="set_threads_30"),
+                InlineKeyboardButton("50", callback_data="set_threads_50")
+            )
+            markup.row(
+                InlineKeyboardButton("70", callback_data="set_threads_70"),
+                InlineKeyboardButton("80", callback_data="set_threads_80"),
+                InlineKeyboardButton("100", callback_data="set_threads_100")
+            )
+            markup.add(InlineKeyboardButton("⬅️", callback_data="tools"))
             bot.send_message(call.message.chat.id, f"🧵 Current: `{MAX_THREADS}`", parse_mode='Markdown', reply_markup=markup)
 
         elif call.data == "retry_settings":
